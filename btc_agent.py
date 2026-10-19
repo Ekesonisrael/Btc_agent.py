@@ -95,7 +95,7 @@ def run_agent():
     """
     
     try:
-        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        response = client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
         ai_output = response.text.strip()
         print(f"AI Output: {ai_output}")
         
