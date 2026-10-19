@@ -94,7 +94,11 @@ def run_agent():
     ai_output = ""
     for attempt in range(3):
         try:
-            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            response = client.models.generate_content(
+    model="gemini-3.8-flash",
+    contents=prompt,
+            )
+            
             ai_output = response.text.strip()
             break # Success, exit loop
         except Exception as e:
