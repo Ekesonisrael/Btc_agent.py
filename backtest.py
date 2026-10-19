@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-backtest_trend.py - daily Donchian-ensemble trend following on BTC vs buy-and-hold.
+backtest.py - daily Donchian-ensemble trend following on BTC vs buy-and-hold.
 Data Source: OKX (Spot)
 """
 import argparse
@@ -17,7 +17,7 @@ ANN = 365  # crypto trades every day
 # --------------------------------------------------------------------------
 # DATA FETCHING (OKX SPOT)
 # --------------------------------------------------------------------------
-def fetch_okx_data(symbol="BTC/USDT", tf="1d", years=10):
+def fetch_okx_data(symbol="BTC/USDT", tf="1d", years=6):
     exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'}
@@ -94,7 +94,6 @@ def load_csv(path):
 # STRATEGY
 # --------------------------------------------------------------------------
 def donchian_ensemble(df):
-    """Fraction of lookbacks currently long. Channel uses PRIOR N days (shifted)."""
     c = df["close"].to_numpy()
     n = len(df)
     states = []
@@ -169,7 +168,7 @@ def block_bootstrap_sharpe_diff(a, b, block=30, sims=2000, seed=7):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--csv")
-    p.add_argument("--years", type=int, default=10, help="years of OKX data to try")
+    p.add_argument("--years", type=int, default=6, help="years of OKX data to try") # Changed from 10 to 6
     p.add_argument("--target-vol", type=float, default=0.40)
     p.add_argument("--cap", type=float, default=1.0, help="max weight (1.0 = no leverage)")
     p.add_argument("--band", type=float, default=0.10)
