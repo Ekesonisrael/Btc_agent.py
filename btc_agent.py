@@ -2,7 +2,6 @@ import os
 import ccxt
 import pandas as pd
 import requests
-import time
 from google import genai
 from datetime import datetime
 
@@ -61,11 +60,14 @@ def run_agent():
         with open(JOURNAL_FILE, 'w') as f:
             f.write("Date,Symbol,Signal,Entry,Stop_Loss,Take_Profit,Size,Reason\n")
     
+    # Fetch Data
     ohlcv = exchange.fetch_ohlcv(SYMBOL, '1h', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = calculate_indicators(df)
     
+    # Get last CLOSED candle
     last = df.iloc[-2] 
+    
     current_price = last['close']
     ema20 = last['EMA_20']
     ema50 = last['EMA_50']
@@ -90,28 +92,15 @@ def run_agent():
     Example: LONG | Price broke above EMA20 with strong RSI momentum
     """
     
-    # Retry Logic for 503 High Demand errors
-    ai_output = ""
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-    model="gemini-3.8-flash",
-    contents=prompt,
-            )
-            
-            ai_output = response.text.strip()
-            break # Success, exit loop
-        except Exception as e:
-            print(f"AI Attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                print("Waiting 5 seconds to retry...")
-                time.sleep(5)
-            else:
-                print("All AI attempts failed. Skipping this hour.")
-                return
+    try:
+        # Using gemini-2.0-flash - most stable free model currently
+        response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+        ai_output = response.text.strip()
+        print(f"AI Output: {ai_output}")
+    except Exception as e:
+        print(f"AI API Error: {e}")
+        return
 
-    print(f"AI Output: {ai_output}")
-    
     if "|" not in ai_output:
         print("AI failed to format correctly. Skipping.")
         return
