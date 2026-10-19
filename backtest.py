@@ -5,6 +5,7 @@ backtest.py - Daily Donchian Ensemble (Trend Following)
 import argparse
 import sys
 import time
+import os
 
 import numpy as np
 import pandas as pd
@@ -13,8 +14,10 @@ import ccxt
 # --------------------------------------------------------------------------
 # DATA FETCHING (OKX 1D)
 # --------------------------------------------------------------------------
-def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1d", years=10):
+def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1Dutc", years=6):
     exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
+    
+    # Calculate start time (now - years)
     start_ms = exchange.milliseconds() - int(years * 365 * 24 * 60 * 60 * 1000)
     since = start_ms
     all_ohlcv = []
@@ -37,10 +40,16 @@ def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1d", years=10):
         if since > exchange.milliseconds():
             break
             
+        if len(all_ohlcv) % 500 == 0:
+            print(f"  Fetched {len(all_ohlcv)} bars...", end="\r")
+            
         time.sleep(exchange.rateLimit / 1000)
         
-    print(f"Total fetched: {len(all_ohlcv)} bars")
+    print(f"\nTotal fetched: {len(all_ohlcv)} bars")
     
+    if len(all_ohlcv) == 0:
+        sys.exit("Error: 0 bars returned from OKX. Check the timeframe or start date.")
+        
     df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
     df = df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
@@ -59,7 +68,7 @@ def add_indicators(df):
     df["atr"] = tr.rolling(14).mean()
     
     # Donchian Channels (Ensemble: 20, 50, 100 days)
-    # We shift by 1 to prevent look-ahead bias
+    # Shift by 1 to prevent look-ahead bias
     df["hh_20"] = df["high"].rolling(20).max().shift(1)
     df["ll_20"] = df["low"].rolling(20).min().shift(1)
     
@@ -72,8 +81,7 @@ def add_indicators(df):
     return df
 
 def make_signals(df):
-    # We only trigger if ALL three Donchian channels agree on a breakout.
-    # This massively reduces false signals.
+    # Only trigger if ALL three Donchian channels agree on a breakout.
     long_breakout = (df["close"] > df["hh_20"]) & (df["close"] > df["hh_50"]) & (df["close"] > df["hh_100"])
     short_breakout = (df["close"] < df["ll_20"]) & (df["close"] < df["ll_50"]) & (df["close"] < df["ll_100"])
     
@@ -108,9 +116,6 @@ def simulate(arr, sig, a, equity0):
             
         entry = o[e] * (1 + s * a.slip)
         stop = entry - s * risk
-        
-        # We don't use a fixed Take Profit. Trend followers let winners run.
-        # We only exit on the trailing stop or opposite signal.
         
         j, px, why = e, None, "timeout"
         highest_high = h[e]
@@ -151,10 +156,8 @@ def simulate(arr, sig, a, equity0):
         net = s * (exit_eff - entry) - a.fee * (entry + exit_eff)
         r_mult = net / risk
         
-        # Volatility-based sizing: Risk exactly 2% of equity based on stop distance
+        # Volatility-based sizing
         size = (eq * a.risk) / risk
-        
-        # Cap max leverage
         size = min(size, eq * a.max_lev / entry)
         
         eq = max(eq + size * net, 0.0)
@@ -190,16 +193,16 @@ def bootstrap_ci(R, sims=5000, seed=1):
 # --------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--atr-mult", type=float, default=3.0) # Wide stop for daily trends
+    p.add_argument("--atr-mult", type=float, default=3.0)
     p.add_argument("--risk", type=float, default=0.02)
     p.add_argument("--fee", type=float, default=0.0005)
     p.add_argument("--slip", type=float, default=0.0005)
     p.add_argument("--max-lev", type=float, default=5.0)
     p.add_argument("--equity", type=float, default=10000.0)
-    p.add_argument("--split", type=float, default=0.85) # Held out final 15%
+    p.add_argument("--split", type=float, default=0.85)
     a = p.parse_args()
 
-    df = fetch_okx_data(years=10)
+    df = fetch_okx_data(years=6)
     df = add_indicators(df)
 
     print(f"\nData: {df['time'].iloc[0]:%Y-%m-%d} -> {df['time'].iloc[-1]:%Y-%m-%d}, {len(df)} bars")
@@ -217,8 +220,7 @@ def main():
     eq = np.concatenate([[a.equity], tr["equity"].to_numpy()])
     max_dd = (eq / np.maximum.accumulate(eq) - 1).min()
     
-    # Calculate Buy & Hold equity curve
-    bh_df = df.iloc[100:].copy() # Start after warmup
+    bh_df = df.iloc[100:].copy()
     bh_equity = a.equity * (bh_df["close"] / bh_df["close"].iloc[0])
     
     print(f"\nEntry mode: Donchian Ensemble | risk {a.risk:.1%} | SL {a.atr_mult}xATR")
@@ -241,7 +243,6 @@ def main():
     print(line(out_sample, "OUT-OF-SAMPLE"))
     
     print("-" * 78)
-    # Pass Bar
     strat_sharpe = R.mean() / R.std(ddof=1) if R.std(ddof=1) > 0 else 0
     bh_returns = bh_df["close"].pct_change().dropna()
     bh_sharpe = bh_returns.mean() / bh_returns.std() if bh_returns.std() > 0 else 0
