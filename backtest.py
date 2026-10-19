@@ -5,7 +5,6 @@ backtest.py - Daily Donchian Ensemble (Trend Following)
 import argparse
 import sys
 import time
-import os
 
 import numpy as np
 import pandas as pd
@@ -14,21 +13,25 @@ import ccxt
 # --------------------------------------------------------------------------
 # DATA FETCHING (OKX 1D)
 # --------------------------------------------------------------------------
-def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1Dutc", years=6):
+def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1d", years=6):
     exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
     
-    # Calculate start time (now - years)
     start_ms = exchange.milliseconds() - int(years * 365 * 24 * 60 * 60 * 1000)
     since = start_ms
     all_ohlcv = []
+    error_count = 0
     
     print(f"Fetching {symbol} {tf} data from OKX...")
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, tf, since=since, limit=100)
+            error_count = 0 # Reset on success
         except Exception as e:
             print(f"\nNetwork error: {e}. Retrying in 2s...")
             time.sleep(2)
+            error_count += 1
+            if error_count > 5:
+                sys.exit("Too many consecutive errors. Check the timeframe or symbol.")
             continue
             
         if not ohlcv:
@@ -107,7 +110,6 @@ def simulate(arr, sig, a, equity0):
             i += 1
             continue
         e = i + 1
-        # Wider stop for daily: 3.0x ATR
         risk = a.atr_mult * atr[i]
         
         if not np.isfinite(risk) or risk <= 0:
@@ -156,7 +158,6 @@ def simulate(arr, sig, a, equity0):
         net = s * (exit_eff - entry) - a.fee * (entry + exit_eff)
         r_mult = net / risk
         
-        # Volatility-based sizing
         size = (eq * a.risk) / risk
         size = min(size, eq * a.max_lev / entry)
         
