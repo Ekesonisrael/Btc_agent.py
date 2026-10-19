@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-backtest.py - daily Donchian-ensemble trend following on BTC vs buy-and-hold.
-Data Source: OKX (Spot)
+backtest.py - daily Donchian-ensemble trend following on SOL Perpetual vs buy-and-hold.
+Data Source: OKX (Swap/Futures)
 """
 import argparse
 import sys
@@ -15,21 +15,22 @@ LOOKBACKS = [5, 10, 20, 30, 60, 90, 150, 250, 360]
 ANN = 365  # crypto trades every day
 
 # --------------------------------------------------------------------------
-# DATA FETCHING (OKX SPOT)
+# DATA FETCHING (OKX SWAP)
 # --------------------------------------------------------------------------
-def fetch_okx_data(symbol="BTC/USDT", tf="1d", years=6):
+def fetch_okx_data(symbol="SOL/USDT:USDT", tf="1d", years=5):
     exchange = ccxt.okx({
         'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
+        'options': {'defaultType': 'swap'} # Changed to swap for perpetual futures
     })
     
     # Calculate start time (now - years)
+    # SOL data on OKX is shorter than BTC, 5 years is a safe start
     start_ms = exchange.milliseconds() - int(years * 365 * 24 * 60 * 60 * 1000)
     since = start_ms
     all_ohlcv = []
     error_count = 0
     
-    print(f"Fetching {symbol} {tf} data from OKX Spot...")
+    print(f"Fetching {symbol} {tf} data from OKX Futures...")
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, tf, since=since, limit=100)
@@ -168,11 +169,11 @@ def block_bootstrap_sharpe_diff(a, b, block=30, sims=2000, seed=7):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--csv")
-    p.add_argument("--years", type=int, default=6, help="years of OKX data to try") # Changed from 10 to 6
+    p.add_argument("--years", type=int, default=5, help="years of OKX data to try") 
     p.add_argument("--target-vol", type=float, default=0.40)
     p.add_argument("--cap", type=float, default=1.0, help="max weight (1.0 = no leverage)")
     p.add_argument("--band", type=float, default=0.10)
-    p.add_argument("--fee", type=float, default=0.0010, help="fee per unit traded (OKX spot taker ~0.10%%)")
+    p.add_argument("--fee", type=float, default=0.0005, help="fee per unit traded (OKX futures taker ~0.05%%)")
     p.add_argument("--slip", type=float, default=0.0005)
     a = p.parse_args()
 
