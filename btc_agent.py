@@ -6,7 +6,7 @@ import csv
 from datetime import datetime, timezone
 
 # ==========================================
-# CONFIGURATION (BTC ONLY - OKX DEMO)
+# CONFIGURATION (SOL ONLY - OKX DEMO)
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -15,10 +15,10 @@ OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET = os.getenv("OKX_SECRET")
 OKX_PASSWORD = os.getenv("OKX_PASSWORD")
 
-SYMBOL = 'BTC/USDT:USDT'
-JOURNAL_FILE = 'btc_journal.csv'
+SYMBOL = 'SOL/USDT:USDT'
+JOURNAL_FILE = 'sol_journal.csv'
 
-RISK_PERCENT = 0.02        # Risk 2% of balance
+RISK_PERCENT = 0.02        # Risk 2% of balance per trade
 ATR_MULTIPLIER = 1.5       
 RR_RATIO = 2.0             
 LEVERAGE = 3
@@ -61,8 +61,14 @@ def calculate_indicators(df):
 
 def run_agent():
     now = datetime.now(timezone.utc)
-    print(f"--- Agent Scanning BTC at {now} ---")
+    print(f"--- Agent Scanning SOL at {now} ---")
     
+    # Ensure journal exists
+    if not os.path.isfile(JOURNAL_FILE):
+        with open(JOURNAL_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Date", "Symbol", "Signal", "Entry", "Stop_Loss", "Take_Profit", "Contracts", "Reason", "Outcome"])
+
     # 1. Set Leverage
     try:
         exchange.set_leverage(LEVERAGE, SYMBOL)
@@ -80,7 +86,7 @@ def run_agent():
         print(f"Error checking positions: {e}")
         return
 
-    # 3. Fetch Data
+    # 3. Fetch Data (1-Hour timeframe)
     try:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, '1h', limit=100)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -132,7 +138,7 @@ def run_agent():
 
         risk_amount = account_balance * RISK_PERCENT
         
-        # 6. THE CONTRACT SIZE FIX
+        # Contract Size Math for SOL
         market = exchange.market(SYMBOL)
         contract_size = market['contractSize'] 
         
@@ -149,8 +155,8 @@ def run_agent():
         try:
             print(f"Placing {side} for {contracts_to_trade} contracts...")
             params = {
-                'stopLoss': {'triggerPrice': round(stop_loss, 2)},
-                'takeProfit': {'triggerPrice': round(take_profit, 2)}
+                'stopLoss': {'triggerPrice': round(stop_loss, 4)},
+                'takeProfit': {'triggerPrice': round(take_profit, 4)}
             }
             
             order = exchange.create_order(
@@ -158,15 +164,12 @@ def run_agent():
             )
             print(f"Order Successful! ID: {order['id']}")
             
-            # 7. CSV FIX
-            file_exists = os.path.isfile(JOURNAL_FILE)
+            # CSV Logging
             with open(JOURNAL_FILE, mode='a', newline='') as f:
                 writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(["Date", "Symbol", "Signal", "Entry", "Stop_Loss", "Take_Profit", "Contracts", "Reason", "Outcome"])
-                writer.writerow([now, SYMBOL, signal, live_price, round(stop_loss,2), round(take_profit,2), contracts_to_trade, reason, "PENDING"])
+                writer.writerow([now, SYMBOL, signal, live_price, round(stop_loss,4), round(take_profit,4), contracts_to_trade, reason, "PENDING"])
                 
-            send_telegram(f"🚨 DEMO TRADE EXECUTED\nSignal: {signal}\nEntry: ${live_price:.2f}\nStop: ${stop_loss:.2f}\nTarget: ${take_profit:.2f}\nSize: {contracts_to_trade} contracts\nReason: {reason}")
+            send_telegram(f"🚨 SOL DEMO TRADE EXECUTED\nSignal: {signal}\nEntry: ${live_price:.4f}\nStop: ${stop_loss:.4f}\nTarget: ${take_profit:.4f}\nSize: {contracts_to_trade} contracts\nReason: {reason}")
             
         except Exception as e:
             print(f"Order Failed: {e}")
