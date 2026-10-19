@@ -2,7 +2,7 @@ name: BTC AI Agent
 
 on:
   schedule:
-    - cron: '0 * * * *' 
+    - cron: '0 */4 * * *' # Runs every 4 hours (6 times a day to save quota)
   workflow_dispatch: 
 
 permissions:
