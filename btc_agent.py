@@ -2,7 +2,7 @@ import os
 import ccxt
 import pandas as pd
 import requests
-import google.generativeai as genai
+from google import genai
 from datetime import datetime
 
 # ==========================================
@@ -22,8 +22,7 @@ ATR_MULTIPLIER = 1.5      # Stop loss is 1.5x ATR
 RR_RATIO = 2.0            # Take profit is 2x the risk
 
 # Setup AI & Exchange
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+client = genai.Client(api_key=GEMINI_API_KEY)
 exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
 
 def send_telegram(message):
@@ -96,7 +95,7 @@ def run_agent():
     """
     
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
         ai_output = response.text.strip()
         print(f"AI Output: {ai_output}")
         
