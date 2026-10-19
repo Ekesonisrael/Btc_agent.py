@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-backtest.py - backtest of the btc_agent.py rule set (EMA20/50 + RSI14 + ATR14 stop).
-Data Source: OKX Futures (BTC/USDT:USDT)
+backtest.py - backtest of the btc_agent.py rule set on 4H timeframe.
 """
 import argparse
 import sys
@@ -13,9 +12,9 @@ import pandas as pd
 import ccxt
 
 # --------------------------------------------------------------------------
-# DATA FETCHING (OKX)
+# DATA FETCHING (OKX 4H)
 # --------------------------------------------------------------------------
-def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1h", years=4):
+def fetch_okx_data(symbol="BTC/USDT:USDT", tf="4h", years=4):
     exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
     
     # Calculate start time (now - years)
@@ -38,7 +37,6 @@ def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1h", years=4):
         all_ohlcv.extend(ohlcv)
         since = ohlcv[-1][0] + 1
         
-        # Stop if we hit current time
         if since > exchange.milliseconds():
             break
             
@@ -54,27 +52,8 @@ def fetch_okx_data(symbol="BTC/USDT:USDT", tf="1h", years=4):
     df = df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
     return df
 
-
-def load_csv(path):
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-    tcol = next((c for c in ("time", "timestamp", "open_time", "date") if c in df.columns), None)
-    if tcol is None:
-        sys.exit("CSV needs a time column: time / timestamp / open_time / date")
-    
-    if pd.api.types.is_numeric_dtype(df[tcol]):
-        first = df[tcol].iloc[0]
-        unit = "us" if first > 1e14 else ("ms" if first > 1e11 else "s")
-        df["time"] = pd.to_datetime(df[tcol], unit=unit, utc=True)
-    else:
-        df["time"] = pd.to_datetime(df[tcol], utc=True)
-        
-    df = df[["time", "open", "high", "low", "close", "volume"]].drop_duplicates("time").sort_values("time").reset_index(drop=True)
-    return df
-
-
 # --------------------------------------------------------------------------
-# INDICATORS + SIGNALS (Same as btc_agent.py)
+# INDICATORS + SIGNALS
 # --------------------------------------------------------------------------
 def add_indicators(df):
     c = df["close"]
@@ -93,7 +72,6 @@ def add_indicators(df):
         df["rsi"] = 100 - 100 / (1 + avg_up / avg_dn)
     return df
 
-
 def make_signals(df, entry_mode):
     long_ = (df["close"] > df["ema20"]) & (df["ema20"] > df["ema50"]) & (df["rsi"] < 70)
     short_ = (df["close"] < df["ema20"]) & (df["ema20"] < df["ema50"]) & (df["rsi"] > 30)
@@ -107,7 +85,6 @@ def make_signals(df, entry_mode):
     warm = np.arange(len(df)) >= 60
     ok = df[["ema20", "ema50", "rsi", "atr"]].notna().all(axis=1).to_numpy() & warm
     return np.where(ok, sig, 0)
-
 
 # --------------------------------------------------------------------------
 # SIMULATION ENGINE
@@ -168,7 +145,6 @@ def simulate(arr, sig, a, equity0):
     cols = ["entry_time", "exit_time", "side", "entry", "exit", "why", "R", "cost_R", "equity", "bars"]
     return pd.DataFrame(out, columns=cols)
 
-
 # --------------------------------------------------------------------------
 # STATS
 # --------------------------------------------------------------------------
@@ -181,20 +157,16 @@ def line(R, label):
     return (f"{label:<14} n={n:<5} win={100 * (R > 0).mean():5.1f}%  "
             f"avgR={R.mean():+.3f}  PF={pf:4.2f}  totR={R.sum():+8.1f}")
 
-
 def bootstrap_ci(R, sims=5000, seed=1):
     rng = np.random.default_rng(seed)
     means = rng.choice(R, size=(sims, len(R)), replace=True).mean(axis=1)
     return np.percentile(means, [2.5, 97.5])
-
 
 # --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--csv")
-    p.add_argument("--years", type=int, default=4)
     p.add_argument("--entry", choices=["state", "event"], default="state")
     p.add_argument("--atr-mult", type=float, default=1.5)
     p.add_argument("--rr", type=float, default=2.0)
@@ -210,7 +182,8 @@ def main():
     p.add_argument("--out", default="backtest_trades.csv")
     a = p.parse_args()
 
-    df = load_csv(a.csv) if a.csv else fetch_okx_data(years=a.years)
+    # Fetch 4H data
+    df = fetch_okx_data(years=4)
     df = add_indicators(df)
 
     step = df["time"].diff().mode().iloc[0]
@@ -249,11 +222,6 @@ def main():
     tr["year"] = pd.to_datetime(tr["entry_time"]).dt.year
     for y, g in tr.groupby("year"):
         print(line(g["R"].to_numpy(), str(y)))
-        
-    cut = df["time"].iloc[int(len(df) * a.split)]
-    early = pd.to_datetime(tr["entry_time"], utc=True) < cut
-    print(line(tr.loc[early, "R"].to_numpy(), "EARLY"))
-    print(line(tr.loc[~early, "R"].to_numpy(), "LATE"))
 
     print("-" * 78)
     rng = np.random.default_rng(a.seed)
@@ -273,9 +241,9 @@ def main():
     print("-" * 78)
     passes = lo > 0 and pval < 0.05
     if passes:
-        print("VERDICT: clears the basic screen (CI above 0, beats the null).")
+        print("VERDICT: CLEARS SCREEN. Edge demonstrated.")
     else:
-        print("VERDICT: edge NOT demonstrated. CI includes 0 and/or doesn't beat random.")
+        print("VERDICT: edge NOT demonstrated. Shelve the strategy.")
 
 if __name__ == "__main__":
     main()
