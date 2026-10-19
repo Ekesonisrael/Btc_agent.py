@@ -159,6 +159,4 @@ def run_agent():
         print("AI decided to WAIT. No trade.")
         
 if __name__ == "__main__":
-    print("Testing Telegram connection...")
-    send_telegram("🤖 Test Message: My BTC AI Agent is connected and ready!")
     run_agent()
