@@ -2,13 +2,13 @@ import os
 import ccxt
 import pandas as pd
 import requests
-from google import genai
+from groq import Groq
 from datetime import datetime
 
 # ==========================================
 # CONFIGURATION (BTC ONLY)
 # ==========================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -16,13 +16,13 @@ SYMBOL = 'BTC/USDT:USDT'
 JOURNAL_FILE = 'btc_journal.csv'
 
 # Risk Settings
-ACCOUNT_BALANCE = 1000.0  # Change this to your real balance
-RISK_PERCENT = 0.02       # Risk 2% per trade
+ACCOUNT_BALANCE = 1000.0  
+RISK_PERCENT = 0.02       
 ATR_MULTIPLIER = 1.5      
 RR_RATIO = 2.0            
 
 # Setup AI & Exchange
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
 
 def send_telegram(message):
@@ -55,19 +55,15 @@ def calculate_indicators(df):
 def run_agent():
     print(f"--- AI Agent Scanning BTC at {datetime.now()} ---")
     
-    # Ensure journal exists (Fix for git pathspec error)
     if not os.path.isfile(JOURNAL_FILE):
         with open(JOURNAL_FILE, 'w') as f:
             f.write("Date,Symbol,Signal,Entry,Stop_Loss,Take_Profit,Size,Reason\n")
     
-    # Fetch Data
     ohlcv = exchange.fetch_ohlcv(SYMBOL, '1h', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = calculate_indicators(df)
     
-    # Get last CLOSED candle
     last = df.iloc[-2] 
-    
     current_price = last['close']
     ema20 = last['EMA_20']
     ema50 = last['EMA_50']
@@ -93,9 +89,13 @@ def run_agent():
     """
     
     try:
-        # Using gemini-2.0-flash - most stable free model currently
-        response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        ai_output = response.text.strip()
+        # Using Llama 3.3 70B on Groq (Insanely fast, very smart, 14,400 free requests/day)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0 # Keep it deterministic (no creative writing)
+        )
+        ai_output = response.choices[0].message.content.strip()
         print(f"AI Output: {ai_output}")
     except Exception as e:
         print(f"AI API Error: {e}")
