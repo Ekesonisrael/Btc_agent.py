@@ -91,7 +91,7 @@ def run_agent():
     try:
         # Using Llama 3.3 70B on Groq (Insanely fast, very smart, 14,400 free requests/day)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0 # Keep it deterministic (no creative writing)
         )
