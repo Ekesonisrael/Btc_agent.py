@@ -2,7 +2,7 @@ name: BTC AI Agent
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # Runs every 4 hours (6 times a day to save quota)
+    - cron: '0 * * * *' # Back to every hour, because Groq allows it!
   workflow_dispatch: 
 
 permissions:
@@ -18,11 +18,11 @@ jobs:
           python-version: '3.12'
           
       - name: Install dependencies
-        run: pip install ccxt pandas google-genai requests
+        run: pip install ccxt pandas groq requests
       
       - name: Run Agent
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python btc_agent.py
