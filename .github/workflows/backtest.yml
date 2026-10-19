@@ -17,4 +17,4 @@ jobs:
         run: pip install numpy pandas requests
       
       - name: Run Trend Backtest
-        run: python backtest_trend.py
+        run: python backtest.py
