@@ -18,4 +18,4 @@ jobs:
         run: pip install numpy pandas ccxt requests
       
       - name: Run Backtest
-        run: python backtest.py --years 4
+        run: python backtest.py
