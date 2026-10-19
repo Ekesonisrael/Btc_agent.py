@@ -3,7 +3,7 @@ import ccxt
 import pandas as pd
 import requests
 from groq import Groq
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ==========================================
 # CONFIGURATION (BTC ONLY)
@@ -53,7 +53,8 @@ def calculate_indicators(df):
     return df
 
 def run_agent():
-    print(f"--- AI Agent Scanning BTC at {datetime.now()} ---")
+    now = datetime.now(timezone.utc)
+    print(f"--- AI Agent Scanning BTC at {now} ---")
     
     if not os.path.isfile(JOURNAL_FILE):
         with open(JOURNAL_FILE, 'w') as f:
@@ -89,11 +90,10 @@ def run_agent():
     """
     
     try:
-        # Using Llama 3.3 70B on Groq (Insanely fast, very smart, 14,400 free requests/day)
         response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0 # Keep it deterministic (no creative writing)
+            temperature=0.0
         )
         ai_output = response.choices[0].message.content.strip()
         print(f"AI Output: {ai_output}")
@@ -109,6 +109,24 @@ def run_agent():
     signal = signal.strip().upper()
     reason = reason.strip()
     
+    # ==========================================
+    # DAILY PULSE (4 times a day: 00, 06, 12, 18 UTC)
+    # ==========================================
+    if now.hour in [0, 6, 12, 18] and now.minute < 15:
+        pulse_msg = (
+            f"🤖 *BTC AI DAILY PULSE* 🤖\n\n"
+            f"*Current Price:* ${current_price:.2f}\n"
+            f"*RSI:* {rsi:.2f}\n"
+            f"*AI Decision:* {signal}\n"
+            f"*Reason:* {reason}\n\n"
+            f"_The bot is alive and watching._"
+        )
+        send_telegram(pulse_msg)
+        print("Daily Pulse sent to Telegram!")
+
+    # ==========================================
+    # TRADE EXECUTION
+    # ==========================================
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG":
             stop_loss = current_price - (ATR_MULTIPLIER * atr)
@@ -123,7 +141,7 @@ def run_agent():
         position_size = risk_amount / risk_per_coin
         
         with open(JOURNAL_FILE, mode='a') as f:
-            f.write(f"{datetime.now()},{SYMBOL},{signal},{current_price:.2f},{stop_loss:.2f},{take_profit:.2f},{position_size:.4f},{reason}\n")
+            f.write(f"{now},{SYMBOL},{signal},{current_price:.2f},{stop_loss:.2f},{take_profit:.2f},{position_size:.4f},{reason}\n")
             
         msg = (
             f"🚨 *BTC AI TRADE ALERT* 🚨\n\n"
