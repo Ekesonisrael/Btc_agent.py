@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-backtest.py - daily Donchian-ensemble trend following on SOL Perpetual vs buy-and-hold.
+backtest.py - daily Donchian-ensemble trend following on ETH Perpetual vs buy-and-hold.
 Data Source: OKX (Swap/Futures)
 """
 import argparse
@@ -17,14 +17,12 @@ ANN = 365  # crypto trades every day
 # --------------------------------------------------------------------------
 # DATA FETCHING (OKX SWAP)
 # --------------------------------------------------------------------------
-def fetch_okx_data(symbol="SOL/USDT:USDT", tf="1d", years=5):
+def fetch_okx_data(symbol="ETH/USDT:USDT", tf="1d", years=6):
     exchange = ccxt.okx({
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'} # Changed to swap for perpetual futures
+        'options': {'defaultType': 'swap'}
     })
     
-    # Calculate start time (now - years)
-    # SOL data on OKX is shorter than BTC, 5 years is a safe start
     start_ms = exchange.milliseconds() - int(years * 365 * 24 * 60 * 60 * 1000)
     since = start_ms
     all_ohlcv = []
@@ -34,13 +32,13 @@ def fetch_okx_data(symbol="SOL/USDT:USDT", tf="1d", years=5):
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, tf, since=since, limit=100)
-            error_count = 0 # Reset on success
+            error_count = 0
         except Exception as e:
             print(f"\nNetwork error: {e}. Retrying in 2s...")
             time.sleep(2)
             error_count += 1
             if error_count > 5:
-                sys.exit("Too many consecutive errors. Check the timeframe or symbol.")
+                sys.exit("Too many consecutive errors.")
             continue
             
         if not ohlcv:
@@ -60,35 +58,11 @@ def fetch_okx_data(symbol="SOL/USDT:USDT", tf="1d", years=5):
     print(f"\nTotal fetched: {len(all_ohlcv)} bars")
     
     if len(all_ohlcv) == 0:
-        sys.exit("Error: 0 bars returned from OKX. Check the symbol or start date.")
+        sys.exit("Error: 0 bars returned from OKX.")
         
     df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
     df = df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
-    return df
-
-def load_csv(path):
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-    tcol = next((c for c in ("time", "timestamp", "open_time", "date") if c in df.columns), None)
-    if tcol is None:
-        sys.exit("CSV needs a time column: time / timestamp / open_time / date")
-    if pd.api.types.is_numeric_dtype(df[tcol]):
-        first = df[tcol].iloc[0]
-        unit = "us" if first > 1e14 else ("ms" if first > 1e11 else "s")
-        df["time"] = pd.to_datetime(df[tcol], unit=unit, utc=True)
-    else:
-        df["time"] = pd.to_datetime(df[tcol], utc=True)
-    df = df[["time", "open", "high", "low", "close", "volume"]].drop_duplicates("time")
-    df = df.sort_values("time").reset_index(drop=True)
-    step = df["time"].diff().median()
-    if step < pd.Timedelta(hours=23):
-        print(f"Resampling {step} bars to daily")
-        df = (df.set_index("time")
-                .resample("1D")
-                .agg({"open": "first", "high": "max", "low": "min",
-                      "close": "last", "volume": "sum"})
-                .dropna().reset_index())
     return df
 
 # --------------------------------------------------------------------------
@@ -168,23 +142,21 @@ def block_bootstrap_sharpe_diff(a, b, block=30, sims=2000, seed=7):
 # --------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--csv")
-    p.add_argument("--years", type=int, default=5, help="years of OKX data to try") 
+    p.add_argument("--years", type=int, default=6)
     p.add_argument("--target-vol", type=float, default=0.40)
-    p.add_argument("--cap", type=float, default=1.0, help="max weight (1.0 = no leverage)")
+    p.add_argument("--cap", type=float, default=1.0)
     p.add_argument("--band", type=float, default=0.10)
-    p.add_argument("--fee", type=float, default=0.0005, help="fee per unit traded (OKX futures taker ~0.05%%)")
+    p.add_argument("--fee", type=float, default=0.0005)
     p.add_argument("--slip", type=float, default=0.0005)
     a = p.parse_args()
 
-    df = load_csv(a.csv) if a.csv else fetch_okx_data(years=a.years)
+    df = fetch_okx_data(symbol="ETH/USDT:USDT", years=a.years)
     df = df.reset_index(drop=True)
     n = len(df)
     if n < max(LOOKBACKS) + 400:
-        print(f"WARNING: only {n} daily bars. After the {max(LOOKBACKS)}-day warm-up "
-              f"that leaves {max(n - max(LOOKBACKS), 0)} days. Too short to trust anything.")
+        print(f"WARNING: only {n} daily bars.")
+        
     cost = a.fee + a.slip
-
     o = df["open"].to_numpy()
     lr = np.log(df["close"]).diff()
     vol = (lr.rolling(30).std() * np.sqrt(ANN)).to_numpy()
@@ -255,11 +227,6 @@ def main():
               "Without C, this is risk management, not an edge.")
     else:
         print("VERDICT: FAILS the pre-set screen. Do not trade it. Do not tune parameters to rescue it.")
-
-    out = pd.DataFrame({"time": days, "trend": rt, "voltarget": rv, "buyhold": rb,
-                        "weight": wa_t[sl]})
-    out.to_csv("trend_daily_returns.csv", index=False)
-    print("Daily returns saved to trend_daily_returns.csv")
 
 if __name__ == "__main__":
     main()
