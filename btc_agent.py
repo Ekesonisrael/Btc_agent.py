@@ -56,10 +56,12 @@ def run_agent():
     now = datetime.now(timezone.utc)
     print(f"--- AI Agent Scanning BTC at {now} ---")
     
+    # Ensure journal exists
     if not os.path.isfile(JOURNAL_FILE):
         with open(JOURNAL_FILE, 'w') as f:
             f.write("Date,Symbol,Signal,Entry,Stop_Loss,Take_Profit,Size,Reason\n")
     
+    # 1. Fetch Data
     ohlcv = exchange.fetch_ohlcv(SYMBOL, '1h', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = calculate_indicators(df)
@@ -71,6 +73,16 @@ def run_agent():
     rsi = last['RSI']
     atr = last['ATR']
     
+    # 2. Read Memory (Last 3 trades for the Learning Loop)
+    memory = ""
+    if os.path.isfile(JOURNAL_FILE):
+        with open(JOURNAL_FILE, 'r') as f:
+            lines = f.readlines()
+            if len(lines) > 1:
+                history = lines[0] + "".join(lines[-3:])
+                memory = f"\nHere are your last 3 trades:\n{history}\n"
+    
+    # 3. The AI Prompt
     prompt = f"""
     You are a quantitative crypto futures trader analyzing BTC.
     Current Price: ${current_price:.2f}
@@ -78,17 +90,20 @@ def run_agent():
     50 EMA: ${ema50:.2f}
     RSI (14): {rsi:.2f}
     ATR (14): {atr:.2f}
+    {memory}
     
     Rules:
     - If trend is UP (Price > 20EMA > 50EMA) and RSI < 70, look for LONG.
     - If trend is DOWN (Price < 20EMA < 50EMA) and RSI > 30, look for SHORT.
     - If the market is choppy or RSI is overextended, say WAIT.
+    - IMPORTANT: Look at your past trades. If you lost money on a LONG recently, be more cautious about taking another LONG unless the setup is perfect. Learn from your history.
     
     Output EXACTLY this format and nothing else:
     SIGNAL | REASON
     Example: LONG | Price broke above EMA20 with strong RSI momentum
     """
     
+    # 4. Ask the AI
     try:
         response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
@@ -109,9 +124,7 @@ def run_agent():
     signal = signal.strip().upper()
     reason = reason.strip()
     
-    # ==========================================
-    # DAILY PULSE (4 times a day: 00, 06, 12, 18 UTC)
-    # ==========================================
+    # 5. DAILY PULSE (4 times a day: 00, 06, 12, 18 UTC)
     if now.hour in [0, 6, 12, 18] and now.minute < 15:
         pulse_msg = (
             f"🤖 *BTC AI DAILY PULSE* 🤖\n\n"
@@ -124,9 +137,7 @@ def run_agent():
         send_telegram(pulse_msg)
         print("Daily Pulse sent to Telegram!")
 
-    # ==========================================
-    # TRADE EXECUTION
-    # ==========================================
+    # 6. TRADE EXECUTION
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG":
             stop_loss = current_price - (ATR_MULTIPLIER * atr)
