@@ -2,6 +2,7 @@ import os
 import ccxt
 import pandas as pd
 import requests
+import time
 from google import genai
 from datetime import datetime
 
@@ -16,10 +17,10 @@ SYMBOL = 'BTC/USDT:USDT'
 JOURNAL_FILE = 'btc_journal.csv'
 
 # Risk Settings
-ACCOUNT_BALANCE = 1000.0  # Change this to your real balance later
+ACCOUNT_BALANCE = 1000.0  # Change this to your real balance
 RISK_PERCENT = 0.02       # Risk 2% per trade
-ATR_MULTIPLIER = 1.5      # Stop loss is 1.5x ATR
-RR_RATIO = 2.0            # Take profit is 2x the risk
+ATR_MULTIPLIER = 1.5      
+RR_RATIO = 2.0            
 
 # Setup AI & Exchange
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -35,18 +36,15 @@ def send_telegram(message):
         print(f"Telegram Error: {e}")
 
 def calculate_indicators(df):
-    # EMAs
     df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
     
-    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # ATR
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -58,26 +56,24 @@ def calculate_indicators(df):
 def run_agent():
     print(f"--- AI Agent Scanning BTC at {datetime.now()} ---")
     
-    # 1. Fetch Data
+    # Ensure journal exists (Fix for git pathspec error)
+    if not os.path.isfile(JOURNAL_FILE):
+        with open(JOURNAL_FILE, 'w') as f:
+            f.write("Date,Symbol,Signal,Entry,Stop_Loss,Take_Profit,Size,Reason\n")
+    
     ohlcv = exchange.fetch_ohlcv(SYMBOL, '1h', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    
-    # 2. Calculate Indicators
     df = calculate_indicators(df)
     
-    # Get the last CLOSED candle (no look-ahead)
     last = df.iloc[-2] 
-    
     current_price = last['close']
     ema20 = last['EMA_20']
     ema50 = last['EMA_50']
     rsi = last['RSI']
     atr = last['ATR']
     
-    # 3. The AI Prompt
     prompt = f"""
     You are a quantitative crypto futures trader analyzing BTC.
-    
     Current Price: ${current_price:.2f}
     20 EMA: ${ema20:.2f}
     50 EMA: ${ema50:.2f}
@@ -94,59 +90,62 @@ def run_agent():
     Example: LONG | Price broke above EMA20 with strong RSI momentum
     """
     
-    try:
-        response = client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
-        ai_output = response.text.strip()
-        print(f"AI Output: {ai_output}")
-        
-        if "|" not in ai_output:
-            print("AI failed to format correctly. Skipping.")
-            return
-            
-        signal, reason = ai_output.split("|", 1)
-        signal = signal.strip().upper()
-        reason = reason.strip()
-        
-        # 4. Execution & Risk Management
-        if signal in ["LONG", "SHORT"]:
-            if signal == "LONG":
-                stop_loss = current_price - (ATR_MULTIPLIER * atr)
-                risk_per_coin = current_price - stop_loss
-                take_profit = current_price + (risk_per_coin * RR_RATIO)
+    # Retry Logic for 503 High Demand errors
+    ai_output = ""
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            ai_output = response.text.strip()
+            break # Success, exit loop
+        except Exception as e:
+            print(f"AI Attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                print("Waiting 5 seconds to retry...")
+                time.sleep(5)
             else:
-                stop_loss = current_price + (ATR_MULTIPLIER * atr)
-                risk_per_coin = stop_loss - current_price
-                take_profit = current_price - (risk_per_coin * RR_RATIO)
-                
-            # Position Sizing
-            risk_amount = ACCOUNT_BALANCE * RISK_PERCENT
-            position_size = risk_amount / risk_per_coin
-            
-            # Log to Journal
-            file_exists = os.path.isfile(JOURNAL_FILE)
-            with open(JOURNAL_FILE, mode='a') as f:
-                if not file_exists:
-                    f.write("Date,Symbol,Signal,Entry,Stop_Loss,Take_Profit,Size,Reason\n")
-                f.write(f"{datetime.now()},{SYMBOL},{signal},{current_price:.2f},{stop_loss:.2f},{take_profit:.2f},{position_size:.4f},{reason}\n")
-                
-            # Send Telegram Alert
-            msg = (
-                f"🚨 *BTC AI TRADE ALERT* 🚨\n\n"
-                f"*Signal:* {signal}\n"
-                f"*Entry:* ${current_price:.2f}\n"
-                f"*Stop Loss:* ${stop_loss:.2f}\n"
-                f"*Take Profit:* ${take_profit:.2f}\n"
-                f"*Size:* {position_size:.4f} BTC\n\n"
-                f"🧠 *AI Reason:* {reason}"
-            )
-            send_telegram(msg)
-            print("Trade Alert Sent to Telegram!")
-            
-        else:
-            print("AI decided to WAIT. No trade.")
-            
-    except Exception as e:
-        print(f"Error: {e}")
+                print("All AI attempts failed. Skipping this hour.")
+                return
 
+    print(f"AI Output: {ai_output}")
+    
+    if "|" not in ai_output:
+        print("AI failed to format correctly. Skipping.")
+        return
+        
+    signal, reason = ai_output.split("|", 1)
+    signal = signal.strip().upper()
+    reason = reason.strip()
+    
+    if signal in ["LONG", "SHORT"]:
+        if signal == "LONG":
+            stop_loss = current_price - (ATR_MULTIPLIER * atr)
+            risk_per_coin = current_price - stop_loss
+            take_profit = current_price + (risk_per_coin * RR_RATIO)
+        else:
+            stop_loss = current_price + (ATR_MULTIPLIER * atr)
+            risk_per_coin = stop_loss - current_price
+            take_profit = current_price - (risk_per_coin * RR_RATIO)
+            
+        risk_amount = ACCOUNT_BALANCE * RISK_PERCENT
+        position_size = risk_amount / risk_per_coin
+        
+        with open(JOURNAL_FILE, mode='a') as f:
+            f.write(f"{datetime.now()},{SYMBOL},{signal},{current_price:.2f},{stop_loss:.2f},{take_profit:.2f},{position_size:.4f},{reason}\n")
+            
+        msg = (
+            f"🚨 *BTC AI TRADE ALERT* 🚨\n\n"
+            f"*Signal:* {signal}\n"
+            f"*Entry:* ${current_price:.2f}\n"
+            f"*Stop Loss:* ${stop_loss:.2f}\n"
+            f"*Take Profit:* ${take_profit:.2f}\n"
+            f"*Size:* {position_size:.4f} BTC\n\n"
+            f"🧠 *AI Reason:* {reason}"
+        )
+        send_telegram(msg)
+        print("Trade Alert Sent to Telegram!")
+        
+    else:
+        print("AI decided to WAIT. No trade.")
+        
 if __name__ == "__main__":
     run_agent()
