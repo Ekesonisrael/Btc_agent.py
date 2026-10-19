@@ -182,7 +182,6 @@ def main():
     p.add_argument("--out", default="backtest_trades.csv")
     a = p.parse_args()
 
-    # Fetch 4H data
     df = fetch_okx_data(years=4)
     df = add_indicators(df)
 
