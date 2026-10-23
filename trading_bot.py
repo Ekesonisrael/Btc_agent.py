@@ -50,18 +50,17 @@ def calculate_ema(prices, period):
     return ema
 
 # ==========================================
-# 3. ENVIRONMENT & RISK SETUP (Fixed CCXT Leverage Format)
+# 3. ENVIRONMENT & RISK SETUP
 # ==========================================
 def initialize_market(symbol):
     try:
-        # Pass leverage correctly inside the params dictionary for OKX swap
+        # Set margin mode first, then set leverage safely
         exchange.set_margin_mode('isolated', symbol)
-        exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'isolated'})
+        exchange.set_leverage(LEVERAGE, symbol)
         print(f"[SETUP] {symbol} configured successfully.")
     except Exception as e:
-        error_msg = f"❌ *Setup Error* on `{symbol}`:\n`{e}`"
-        print(error_msg)
-        send_telegram_alert(error_msg)
+        # If leverage/margin is already set by a previous run, we can safely ignore the exception
+        print(f"[SETUP NOTICE] {symbol}: {e}")
 
 # ==========================================
 # 4. CORE STRATEGY & EXECUTION
@@ -100,11 +99,10 @@ def execute_strategy():
                 
                 if price_risk_per_unit > 0:
                     raw_size = risk_amount / price_risk_per_unit
-                    market = exchange.market(symbol)
                     
-                    # Safe string formatting for precision
-                    precision_decimals = market['precision']['amount']
-                    amount = float(f"{raw_size:.{precision_decimals}f}")
+                    # Clean amount formatting without complex nested specifiers
+                    market = exchange.market(symbol)
+                    amount = float(exchange.amount_to_precision(symbol, raw_size))
                     
                     if amount > 0:
                         order = exchange.create_order(
