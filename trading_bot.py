@@ -6,7 +6,6 @@ import requests
 # ==========================================
 # CONFIGURATION & CREDENTIALS
 # ==========================================
-# Using the exact environment variable names passed by your GitHub workflow YAML
 API_KEY = os.getenv("OKX_API_KEY")
 API_SECRET = os.getenv("OKX_API_SECRET")
 API_PASSWORD = os.getenv("OKX_PASSWORD")
@@ -38,7 +37,7 @@ def send_telegram_alert(message):
 
 
 def initialize_exchange():
-    """Initializes and authenticates the CCXT OKX exchange client."""
+    """Initializes and authenticates the CCXT OKX exchange client for linear swaps."""
     try:
         ex = ccxt.okx({
             'apiKey': API_KEY,
@@ -56,7 +55,7 @@ def initialize_exchange():
 
 
 def setup_market_leverage(exchange, symbol):
-    """Safely configures margin mode and leverage."""
+    """Safely configures margin mode and leverage matching OKX parameter expectations."""
     try:
         try:
             exchange.set_margin_mode('cross', symbol)
@@ -81,7 +80,7 @@ def check_trade_outcomes_and_history(exchange):
 
 
 def run_market_strategy(exchange):
-    """Executes the strategy scan safely."""
+    """Executes the strategy scan safely with complete try/except isolation."""
     print("--- Running Market Structure & Liquidity Sweep Scan ---")
     
     for symbol in SYMBOLS:
@@ -109,9 +108,8 @@ def run_market_strategy(exchange):
 if __name__ == "__main__":
     print("[INIT] Starting structural blueprint scan & outcome check...")
     
-    # Check exact variables matching the workflow
     if not API_KEY or not API_SECRET:
-        print(f"[CRITICAL] Missing API credentials! API_KEY present: {bool(API_KEY)}, API_SECRET present: {bool(API_SECRET)}")
+        print("[CRITICAL] Missing API credentials in environment variables!")
         sys.exit(1)
         
     bot_exchange = initialize_exchange()
