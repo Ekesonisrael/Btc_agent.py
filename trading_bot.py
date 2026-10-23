@@ -3,6 +3,7 @@ import sys
 import json
 import ccxt
 import requests
+import pandas as pd
 
 # ==========================================
 # CONFIGURATION & SECRETS
@@ -15,7 +16,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 3
-RISK_PERCENTAGE = 0.05  # 5% Risk per trade
+RISK_PERCENTAGE = 0.03  # Set to 3% risk for demo testing
 JOURNAL_FILE = "trade_journal.json"
 
 
@@ -32,13 +33,15 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"[TELEGRAM ERROR] {r.text}")
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
 
 
 def log_trade_to_memory(data):
-    """Provides memory/learning capability by saving execution logs locally."""
+    """Saves execution logs locally for repository journaling."""
     try:
         history = []
         if os.path.exists(JOURNAL_FILE):
@@ -48,7 +51,7 @@ def log_trade_to_memory(data):
         with open(JOURNAL_FILE, "w") as f:
             json.dump(history, f, indent=4)
     except Exception as e:
-        print(f"[JOURNAL ERROR] Could not save trade memory: {e}")
+        print(f"[JOURNAL ERROR] {e}")
 
 
 def initialize_exchange():
@@ -65,7 +68,7 @@ def initialize_exchange():
         ex.load_markets()
         return ex
     except Exception as e:
-        print(f"[CRITICAL ERROR] Failed to initialize OKX exchange: {e}")
+        print(f"[CRITICAL ERROR] Failed to initialize: {e}")
         sys.exit(1)
 
 
@@ -79,7 +82,7 @@ def setup_market_leverage(exchange, symbol):
         exchange.set_leverage(LEVERAGE, symbol, {'lever': str(LEVERAGE), 'mgnMode': 'cross'})
         print(f"[SETUP] {symbol}: Leverage configured to {LEVERAGE}x.")
     except Exception as e:
-        print(f"[SETUP NOTICE] {symbol}: Leverage configuration note -> {e}")
+        print(f"[SETUP NOTICE] {symbol}: {e}")
 
 
 def has_active_position_or_order(exchange, symbol):
@@ -96,150 +99,100 @@ def has_active_position_or_order(exchange, symbol):
             print(f"[GUARD] Active pending orders exist for {symbol}. Skipping.")
             return True
     except Exception as e:
-        print(f"[GUARD WARNING] Could not verify open positions for {symbol}: {e}")
+        print(f"[GUARD WARNING] {symbol}: {e}")
     return False
 
 
-def calculate_ema(prices, period):
-    """Calculates Exponential Moving Average (EMA)."""
-    if len(prices) < period:
-        return []
-    multiplier = 2 / (period + 1)
-    ema = [sum(prices[:period]) / period]
-    for price in prices[period:]:
-        ema.append((price - ema[-1]) * multiplier + ema[-1])
-    return ema
-
-
 def run_market_strategy(exchange):
-    """Executes the 4H macro trend & 15m structural liquidity sweep strategy with 5% risk & SL/TP."""
+    """Executes the 4H macro trend & 15m structural liquidity sweep strategy."""
     print("--- Running Market Structure & Liquidity Sweep Scan ---")
     
     for symbol in SYMBOLS:
         try:
             setup_market_leverage(exchange, symbol)
             
-            # Guard check to prevent double-trading
             if has_active_position_or_order(exchange, symbol):
                 continue
             
-            # Fetch candle data
-            ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50)
-            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
+            ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
+            ohlcv_15m = exchange.fetch_ohlcv(symbol, '15m', limit=50)
             
             if not ohlcv_4h or not ohlcv_15m or len(ohlcv_4h) < 30 or len(ohlcv_15m) < 30:
                 print(f"[SKIP] {symbol}: Insufficient candle data fetched.")
                 continue
             
-            # 1. 4H Macro Trend Evaluation
-            closes_4h = [candle[4] for candle in ohlcv_4h]
-            ema20_4h = calculate_ema(closes_4h, 20)
-            ema50_4h = calculate_ema(closes_4h, 50)
+            df_4h = pd.DataFrame(ohlcv_4h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            df_15m = pd.DataFrame(ohlcv_15m, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            if not ema20_4h or not ema50_4h:
-                continue
-                
-            is_bullish_macro = ema20_4h[-1] > ema50_4h[-1]
-            is_bearish_macro = ema20_4h[-1] < ema50_4h[-1]
+            df_4h['ema20'] = df_4h['c'].ewm(span=20, adjust=False).mean()
+            df_4h['ema50'] = df_4h['c'].ewm(span=50, adjust=False).mean()
             
-            # 2. 15m Liquidity Sweep Evaluation
-            closes_15m = [candle[4] for candle in ohlcv_15m]
-            lows_15m = [candle[3] for candle in ohlcv_15m]
-            highs_15m = [candle[2] for candle in ohlcv_15m]
+            is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
+            is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
             
-            current_price = closes_15m[-1]
-            recent_low = min(lows_15m[-20:-1])
-            recent_high = max(highs_15m[-20:-1])
+            current_price = df_15m['c'].iloc[-1]
+            recent_low = df_15m['l'].iloc[-20:-1].min()
+            recent_high = df_15m['h'].iloc[-20:-1].max()
             
-            swept_low = lows_15m[-1] < recent_low and current_price > recent_low
-            swept_high = highs_15m[-1] > recent_high and current_price < recent_high
+            swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
+            swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
-            # 3. Execution Logic
-            if is_bullish_macro and swept_low:
-                print(f"🚨 [SIGNAL] Bullish liquidity sweep on {symbol} at {current_price}")
-                
-                entry_price = current_price
-                stop_loss = recent_low * 0.995  # Protected SL below sweep
-                take_profit = entry_price + (entry_price - stop_loss) * 2.5  # 1:2.5 R:R
-                
-                balance = exchange.fetch_balance()['USDT']['free']
-                risk_amount = balance * RISK_PERCENTAGE
-                price_risk_per_unit = entry_price - stop_loss
-                
-                if price_risk_per_unit > 0:
-                    raw_size = risk_amount / price_risk_per_unit
-                    market = exchange.market(symbol)
-                    amount = float(f"{raw_size:.{market['precision']['amount']}f}")
-                    
-                    if amount > 0:
-                        order = exchange.create_order(
-                            symbol=symbol,
-                            type='limit',
-                            side='buy',
-                            amount=amount,
-                            price=entry_price,
-                            params={
-                                'tpTriggerPx': take_profit,
-                                'slTriggerPx': stop_loss
-                            }
-                        )
-                        
-                        success_msg = (
-                            f"✅ *Long Order Executed (Demo - 5% Risk)*\n\n"
-                            f"*Asset:* `{symbol}`\n"
-                            f"*Size:* `{amount}`\n"
-                            f"*Entry:* `{entry_price}`\n"
-                            f"*Stop Loss:* `{stop_loss:.2f}`\n"
-                            f"*Take Profit:* `{take_profit:.2f}`\n"
-                            f"*Order ID:* `{order['id']}`"
-                        )
-                        print(success_msg)
-                        send_telegram_alert(success_msg)
-                        log_trade_to_memory({"symbol": symbol, "side": "buy", "entry": entry_price, "amount": amount, "status": "executed"})
-
-            elif is_bearish_macro and swept_high:
-                print(f"🚨 [SIGNAL] Bearish liquidity sweep on {symbol} at {current_price}")
-                
-                entry_price = current_price
-                stop_loss = recent_high * 1.005  # Protected SL above sweep
-                take_profit = entry_price - (stop_loss - entry_price) * 2.5  # 1:2.5 R:R
-                
-                balance = exchange.fetch_balance()['USDT']['free']
-                risk_amount = balance * RISK_PERCENTAGE
-                price_risk_per_unit = stop_loss - entry_price
-                
-                if price_risk_per_unit > 0:
-                    raw_size = risk_amount / price_risk_per_unit
-                    market = exchange.market(symbol)
-                    amount = float(f"{raw_size:.{market['precision']['amount']}f}")
-                    
-                    if amount > 0:
-                        order = exchange.create_order(
-                            symbol=symbol,
-                            type='limit',
-                            side='sell',
-                            amount=amount,
-                            price=entry_price,
-                            params={
-                                'tpTriggerPx': take_profit,
-                                'slTriggerPx': stop_loss
-                            }
-                        )
-                        
-                        success_msg = (
-                            f"✅ *Short Order Executed (Demo - 5% Risk)*\n\n"
-                            f"*Asset:* `{symbol}`\n"
-                            f"*Size:* `{amount}`\n"
-                            f"*Entry:* `{entry_price}`\n"
-                            f"*Stop Loss:* `{stop_loss:.2f}`\n"
-                            f"*Take Profit:* `{take_profit:.2f}`\n"
-                            f"*Order ID:* `{order['id']}`"
-                        )
-                        print(success_msg)
-                        send_telegram_alert(success_msg)
-                        log_trade_to_memory({"symbol": symbol, "side": "sell", "entry": entry_price, "amount": amount, "status": "executed"})
+            if is_bullish and swept_low:
+                entry = current_price
+                sl = recent_low * 0.995
+                tp = entry + (entry - sl) * 2.5
+                side = 'buy'
+            elif is_bearish and swept_high:
+                entry = current_price
+                sl = recent_high * 1.005
+                tp = entry - (sl - entry) * 2.5
+                side = 'sell'
             else:
                 print(f"[HOLD] {symbol}: No clean setup. Monitoring structural sweep.")
+                continue
+
+            # ---- POSITION SIZING & CONTRACT SIZE FIX ----
+            balance = exchange.fetch_balance()['USDT']['free']
+            risk_amount = balance * RISK_PERCENTAGE
+            price_risk = abs(entry - sl)
+            
+            market = exchange.market(symbol)
+            contract_size = market['contractSize']
+            
+            raw_contracts = (risk_amount / price_risk) / contract_size
+            amount = float(exchange.amount_to_precision(symbol, raw_contracts))
+            
+            if amount > 0:
+                print(f"Executing {side} market order for {amount} contracts...")
+                order = exchange.create_order(
+                    symbol=symbol,
+                    type='market',
+                    side=side,
+                    amount=amount,
+                    params={
+                        'tpTriggerPx': tp,
+                        'slTriggerPx': sl
+                    }
+                )
+                
+                success_msg = (
+                    f"✅ *{side.upper()} Market Order Executed (Demo - 3% Risk)*\n\n"
+                    f"*Asset:* `{symbol}`\n"
+                    f"*Contracts:* `{amount}`\n"
+                    f"*Est Entry:* `{entry:.4f}`\n"
+                    f"*Stop Loss:* `{sl:.4f}`\n"
+                    f"*Take Profit:* `{tp:.4f}`\n"
+                    f"*Order ID:* `{order['id']}`"
+                )
+                print(success_msg)
+                send_telegram_alert(success_msg)
+                log_trade_to_memory({
+                    "symbol": symbol,
+                    "side": side,
+                    "entry": entry,
+                    "contracts": amount,
+                    "status": "executed"
+                })
                 
         except Exception as e:
             err_msg = f"⚠️ *Bot Error* on `{symbol}`:\n`{str(e)}`"
