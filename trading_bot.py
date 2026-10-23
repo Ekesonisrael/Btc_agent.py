@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 import ccxt
 import requests
 
@@ -13,25 +12,15 @@ API_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Standard OKX linear futures symbol format
 SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 3
 
-# Initialize CCXT OKX Exchange client
-exchange = ccxt.okx({
-    'apiKey': API_KEY,
-    'secret': API_SECRET,
-    'password': API_PASSWORD,
-    'enableRateLimit': True,
-})
-
-# Enable Sandbox / Demo trading mode explicitly
-exchange.set_sandbox_mode(True)
-
 
 def send_telegram_alert(message):
-    """Sends execution logs and trade updates directly to Telegram."""
+    """Sends execution logs and trade updates directly to Telegram safely."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TELEGRAM] (Not Configured) {message}")
+        print(f"[TELEGRAM] (Skipped - Not Configured) {message}")
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -43,83 +32,93 @@ def send_telegram_alert(message):
     try:
         response = requests.post(url, json=payload, timeout=10)
         if not response.ok:
-            print(f"[TELEGRAM ERROR] Failed to send alert: {response.text}")
+            print(f"[TELEGRAM ERROR] {response.text}")
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
 
 
-def initialize_market_setup(symbol):
-    """Configures margin mode and leverage properly, handling CCXT parameter requirements."""
+def initialize_exchange():
+    """Initializes and authenticates the CCXT OKX exchange client."""
     try:
-        # Fetch markets to ensure valid symbol loading
-        exchange.load_markets()
-        
-        # Set cross margin mode
+        ex = ccxt.okx({
+            'apiKey': API_KEY,
+            'secret': API_SECRET,
+            'password': API_PASSWORD,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}  # Ensure futures linear swap mode
+        })
+        # Enable Sandbox / Demo trading mode explicitly
+        ex.set_sandbox_mode(True)
+        ex.load_markets()
+        return ex
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Failed to initialize OKX exchange: {e}")
+        sys.exit(1)
+
+
+def setup_market_leverage(exchange, symbol):
+    """Safely configures margin mode and leverage without crashing on minor warnings."""
+    try:
+        # Cross margin mode
         try:
             exchange.set_margin_mode('cross', symbol)
-        except Exception as mm_err:
-            # Margin mode might already be set
-            pass
+        except Exception:
+            pass  # Already set or unsupported in specific sandbox states
 
-        # Set leverage with correct parameter mapping to avoid terminal warnings
-        try:
-            exchange.set_leverage(LEVERAGE, symbol, {'lever': str(LEVERAGE), 'mgnMode': 'cross'})
-        except Exception as lev_err:
-            print(f"[SETUP NOTICE] {symbol}: Leverage set note -> {lev_err}")
-            
+        # Set leverage
+        exchange.set_leverage(LEVERAGE, symbol, {'lever': str(LEVERAGE), 'mgnMode': 'cross'})
+        print(f"[SETUP] {symbol}: Leverage configured to {LEVERAGE}x.")
     except Exception as e:
-        print(f"[SETUP WARNING] {symbol}: Could not initialize market parameters -> {e}")
+        print(f"[SETUP NOTICE] {symbol}: Leverage configuration note -> {e}")
 
 
-def check_trade_outcomes_and_history():
-    """Checks recent history and active position outcomes."""
+def check_trade_outcomes_and_history(exchange):
+    """Evaluates recent closed trades safely."""
     print("--- Checking Recent Trade Outcomes & History ---")
     for symbol in SYMBOLS:
         try:
-            # Fetch closed orders or trade history to evaluate past performance
-            closed_orders = exchange.fetch_closed_orders(symbol, limit=5)
-            print(f"[HISTORY] {symbol}: Evaluated {len(closed_orders)} recent executed orders.")
+            closed_orders = exchange.fetch_closed_orders(symbol, limit=3)
+            print(f"[HISTORY] {symbol}: Checked {len(closed_orders)} recent orders.")
         except Exception as e:
-            print(f"[ERROR checking history for {symbol}]: {e}")
+            print(f"[HISTORY NOTICE] {symbol}: Could not fetch closed orders -> {e}")
 
 
-def run_market_strategy():
-    """Executes the 4H macro trend & 15m structural liquidity sweep strategy."""
+def run_market_strategy(exchange):
+    """Executes the strategy scan safely with complete try/except isolation."""
     print("--- Running Market Structure & Liquidity Sweep Scan ---")
     
     for symbol in SYMBOLS:
-        # Initialize market leverage & margins securely
-        initialize_market_setup(symbol)
-        
         try:
-            # Fetch 4H and 15m OHLCV candle data
-            ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50)
-            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
+            setup_market_leverage(exchange, symbol)
             
-            if not ohlcv_4h or not ohlcv_15m:
-                print(f"[SKIP] {symbol}: Insufficient candle data fetched.")
+            # Fetch candle data securely
+            ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=20)
+            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
+            
+            if not ohlcv_4h or not ohlcv_15m or len(ohlcv_15m) < 5:
+                print(f"[SKIP] {symbol}: Insufficient candle data returned.")
                 continue
             
-            # Simple structural evaluation placeholder
-            # (Integrate your liquidity sweep / fair value gap logic here)
+            # Strategy placeholder logic
             if "BTC" in symbol:
-                print(f"[WAIT] {symbol}: Waiting for clean 15m sweep in bearish 4H trend.")
+                print(f"[WAIT] {symbol}: Monitoring 15m structural liquidity sweep in 4H trend.")
             else:
-                print(f"[HOLD] {symbol}: 4H macro trend is consolidating. Sitting on hands.")
+                print(f"[HOLD] {symbol}: Consolidating. No action taken.")
                 
         except Exception as e:
+            error_msg = f"⚠️ *OKX Bot Error* on `{symbol}`:\n`{str(e)}`"
             print(f"[STRATEGY ERROR] {symbol}: {e}")
-            send_telegram_alert(f"⚠️ *OKX Bot Error* on `{symbol}`:\n`{str(e)}`")
+            send_telegram_alert(error_msg)
 
 
 if __name__ == "__main__":
     print("[INIT] Starting structural blueprint scan & outcome check...")
     
-    # Validate core keys before proceeding
     if not API_KEY or not API_SECRET:
-        print("[CRITICAL] Missing OKX API keys or secret environment variables!")
+        print("[CRITICAL] Missing API credentials in environment variables!")
         sys.exit(1)
         
-    check_trade_outcomes_and_history()
-    run_market_strategy()
+    bot_exchange = initialize_exchange()
+    check_trade_outcomes_and_history(bot_exchange)
+    run_market_strategy(bot_exchange)
     print("[COMPLETE] Scan and review finished safely.")
