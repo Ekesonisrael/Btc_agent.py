@@ -6,13 +6,13 @@ import requests
 # ==========================================
 # CONFIGURATION & CREDENTIALS
 # ==========================================
+# Using the exact environment variable names passed by your GitHub workflow YAML
 API_KEY = os.getenv("OKX_API_KEY")
-API_SECRET = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET")
+API_SECRET = os.getenv("OKX_API_SECRET")
 API_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Standard OKX linear futures symbol format
 SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 3
 
@@ -45,9 +45,8 @@ def initialize_exchange():
             'secret': API_SECRET,
             'password': API_PASSWORD,
             'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}  # Ensure futures linear swap mode
+            'options': {'defaultType': 'swap'}
         })
-        # Enable Sandbox / Demo trading mode explicitly
         ex.set_sandbox_mode(True)
         ex.load_markets()
         return ex
@@ -57,15 +56,13 @@ def initialize_exchange():
 
 
 def setup_market_leverage(exchange, symbol):
-    """Safely configures margin mode and leverage without crashing on minor warnings."""
+    """Safely configures margin mode and leverage."""
     try:
-        # Cross margin mode
         try:
             exchange.set_margin_mode('cross', symbol)
         except Exception:
-            pass  # Already set or unsupported in specific sandbox states
+            pass
 
-        # Set leverage
         exchange.set_leverage(LEVERAGE, symbol, {'lever': str(LEVERAGE), 'mgnMode': 'cross'})
         print(f"[SETUP] {symbol}: Leverage configured to {LEVERAGE}x.")
     except Exception as e:
@@ -84,14 +81,13 @@ def check_trade_outcomes_and_history(exchange):
 
 
 def run_market_strategy(exchange):
-    """Executes the strategy scan safely with complete try/except isolation."""
+    """Executes the strategy scan safely."""
     print("--- Running Market Structure & Liquidity Sweep Scan ---")
     
     for symbol in SYMBOLS:
         try:
             setup_market_leverage(exchange, symbol)
             
-            # Fetch candle data securely
             ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=20)
             ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
             
@@ -99,7 +95,6 @@ def run_market_strategy(exchange):
                 print(f"[SKIP] {symbol}: Insufficient candle data returned.")
                 continue
             
-            # Strategy placeholder logic
             if "BTC" in symbol:
                 print(f"[WAIT] {symbol}: Monitoring 15m structural liquidity sweep in 4H trend.")
             else:
@@ -114,8 +109,9 @@ def run_market_strategy(exchange):
 if __name__ == "__main__":
     print("[INIT] Starting structural blueprint scan & outcome check...")
     
+    # Check exact variables matching the workflow
     if not API_KEY or not API_SECRET:
-        print("[CRITICAL] Missing API credentials in environment variables!")
+        print(f"[CRITICAL] Missing API credentials! API_KEY present: {bool(API_KEY)}, API_SECRET present: {bool(API_SECRET)}")
         sys.exit(1)
         
     bot_exchange = initialize_exchange()
