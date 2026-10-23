@@ -2,9 +2,8 @@ name: OKX Trading Bot Execution
 
 on:
   schedule:
-    # Runs every 15 minutes
     - cron: '*/15 * * * *'
-  workflow_dispatch: # Allows you to manually trigger it anytime from GitHub
+  workflow_dispatch: 
 
 jobs:
   run-bot:
@@ -27,7 +26,9 @@ jobs:
       - name: Run Trading Bot Script
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
-          OKX_API_PASSWORD: ${{ secrets.OKX_API_PASSWORD }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET }}
+          OKX_PASSWORD: ${{ secrets.OKX_PASSWORD }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python trading_bot.py
