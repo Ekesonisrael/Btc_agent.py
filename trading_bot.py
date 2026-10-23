@@ -24,11 +24,11 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"[TELEGRAM ERROR] Failed to send alert: {e}")
 
-# Initialize OKX connection matching your exact GitHub secret names
+# Initialize OKX connection
 exchange = ccxt.okx({
     'apiKey': os.getenv('OKX_API_KEY'),
     'secret': os.getenv('OKX_SECRET_KEY'),
-    'password': os.getenv('OKX_PASSWORD'),  # Matches your OKX_PASSWORD secret
+    'password': os.getenv('OKX_PASSWORD'),
     'options': {'defaultType': 'swap'}
 })
 
@@ -36,7 +36,7 @@ exchange = ccxt.okx({
 exchange.set_sandbox_mode(True)
 
 SYMBOLS = ['BTC/USDT:USDT', 'SOL/USDT:USDT']
-RISK_PERCENTAGE = 0.05  # Increased risk profile to 5% per trade
+RISK_PERCENTAGE = 0.05  # 5% Risk per trade
 LEVERAGE = 3
 
 # ==========================================
@@ -50,12 +50,13 @@ def calculate_ema(prices, period):
     return ema
 
 # ==========================================
-# 3. ENVIRONMENT & RISK SETUP
+# 3. ENVIRONMENT & RISK SETUP (Fixed CCXT Leverage Format)
 # ==========================================
 def initialize_market(symbol):
     try:
-        exchange.set_leverage(LEVERAGE, symbol)
+        # Pass leverage correctly inside the params dictionary for OKX swap
         exchange.set_margin_mode('isolated', symbol)
+        exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'isolated'})
         print(f"[SETUP] {symbol} configured successfully.")
     except Exception as e:
         error_msg = f"❌ *Setup Error* on `{symbol}`:\n`{e}`"
@@ -87,6 +88,7 @@ def execute_strategy():
             if is_bullish_trend and did_bounce:
                 signal_msg = f"🚨 *OKX DEMO SIGNAL DETECTED*\n\n*Asset:* `{symbol}`\n*Action:* `BUY (LONG)`\n*Price:* `{current_price}`"
                 print(signal_msg)
+                send_telegram_alert(signal_msg)
                 
                 entry_price = current_price
                 stop_loss = entry_price * 0.985
@@ -99,7 +101,10 @@ def execute_strategy():
                 if price_risk_per_unit > 0:
                     raw_size = risk_amount / price_risk_per_unit
                     market = exchange.market(symbol)
-                    amount = float(f"{raw_size:.{market['precision']['amount']}f}")
+                    
+                    # Safe string formatting for precision
+                    precision_decimals = market['precision']['amount']
+                    amount = float(f"{raw_size:.{precision_decimals}f}")
                     
                     if amount > 0:
                         order = exchange.create_order(
