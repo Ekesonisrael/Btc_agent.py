@@ -11,6 +11,9 @@ on:
     types: [trigger-bot]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -27,7 +30,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt requests pandas
+          pip install ccxt pandas requests
 
       - name: Run Trading Bot Script
         env:
@@ -36,14 +39,13 @@ jobs:
           OKX_PASSWORD: ${{ secrets.OKX_PASSWORD }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python trading_bot.py
-
-      - name: Commit Journal
+        run: python trading_bot.py
+          
+      # THIS IS THE FIX: Saves the memory so it learns
+      - name: Commit and Save Journal
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add trade_journal.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update journal [skip ci]"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update trade journal [skip ci]"
           git push || true
- 
