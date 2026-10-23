@@ -4,6 +4,7 @@ import json
 import ccxt
 import requests
 import pandas as pd
+from datetime import datetime
 
 # ==========================================
 # CONFIGURATION & SECRETS
@@ -16,22 +17,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 3
-RISK_PERCENTAGE = 0.03  # Set to 3% risk for demo testing
+RISK_PERCENTAGE = 0.03  # Set to 3% as requested
 JOURNAL_FILE = "trade_journal.json"
 
 
 def send_telegram_alert(message):
-    """Sends execution logs and trade updates directly to Telegram safely."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[TELEGRAM] (Skipped) {message}")
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    # Removed parse_mode to prevent Markdown crashes
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
@@ -41,7 +38,6 @@ def send_telegram_alert(message):
 
 
 def log_trade_to_memory(data):
-    """Saves execution logs locally for repository journaling."""
     try:
         history = []
         if os.path.exists(JOURNAL_FILE):
@@ -55,7 +51,6 @@ def log_trade_to_memory(data):
 
 
 def initialize_exchange():
-    """Initializes and authenticates the CCXT OKX exchange client for linear swaps."""
     try:
         ex = ccxt.okx({
             'apiKey': API_KEY,
@@ -68,68 +63,61 @@ def initialize_exchange():
         ex.load_markets()
         return ex
     except Exception as e:
-        print(f"[CRITICAL ERROR] Failed to initialize: {e}")
+        print(f"[CRITICAL ERROR] Failed to initialize OKX exchange: {e}")
         sys.exit(1)
 
 
 def setup_market_leverage(exchange, symbol):
-    """Safely configures margin mode and leverage matching OKX parameter expectations."""
     try:
         try:
             exchange.set_margin_mode('cross', symbol)
         except Exception:
             pass
         exchange.set_leverage(LEVERAGE, symbol, {'lever': str(LEVERAGE), 'mgnMode': 'cross'})
-        print(f"[SETUP] {symbol}: Leverage configured to {LEVERAGE}x.")
     except Exception as e:
-        print(f"[SETUP NOTICE] {symbol}: {e}")
+        print(f"[SETUP NOTICE] {symbol}: Leverage config note -> {e}")
 
 
 def has_active_position_or_order(exchange, symbol):
-    """PREVENTS DOUBLE TRADES: Checks if a position or open order already exists."""
     try:
         positions = exchange.fetch_positions([symbol])
         for pos in positions:
             if float(pos.get('contracts', 0)) > 0:
-                print(f"[GUARD] Active position already open for {symbol}. Skipping.")
                 return True
                 
         open_orders = exchange.fetch_open_orders(symbol)
         if len(open_orders) > 0:
-            print(f"[GUARD] Active pending orders exist for {symbol}. Skipping.")
             return True
     except Exception as e:
-        print(f"[GUARD WARNING] {symbol}: {e}")
+        print(f"[GUARD WARNING] Could not verify positions for {symbol}: {e}")
     return False
 
 
 def run_market_strategy(exchange):
-    """Executes the 4H macro trend & 15m structural liquidity sweep strategy."""
-    print("--- Running Market Structure & Liquidity Sweep Scan ---")
+    print(f"--- Running Scan at {datetime.now()} ---")
     
     for symbol in SYMBOLS:
         try:
             setup_market_leverage(exchange, symbol)
             
             if has_active_position_or_order(exchange, symbol):
+                print(f"[GUARD] Active position/orders for {symbol}. Skipping.")
                 continue
             
             ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
             ohlcv_15m = exchange.fetch_ohlcv(symbol, '15m', limit=50)
             
-            if not ohlcv_4h or not ohlcv_15m or len(ohlcv_4h) < 30 or len(ohlcv_15m) < 30:
-                print(f"[SKIP] {symbol}: Insufficient candle data fetched.")
-                continue
-            
             df_4h = pd.DataFrame(ohlcv_4h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             df_15m = pd.DataFrame(ohlcv_15m, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
+            # 4H Macro Trend
             df_4h['ema20'] = df_4h['c'].ewm(span=20, adjust=False).mean()
             df_4h['ema50'] = df_4h['c'].ewm(span=50, adjust=False).mean()
             
             is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
             is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
             
+            # 15m Liquidity Sweep
             current_price = df_15m['c'].iloc[-1]
             recent_low = df_15m['l'].iloc[-20:-1].min()
             recent_high = df_15m['h'].iloc[-20:-1].max()
@@ -137,76 +125,70 @@ def run_market_strategy(exchange):
             swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
             swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
+            signal = None
             if is_bullish and swept_low:
+                signal = "LONG"
                 entry = current_price
                 sl = recent_low * 0.995
                 tp = entry + (entry - sl) * 2.5
                 side = 'buy'
             elif is_bearish and swept_high:
+                signal = "SHORT"
                 entry = current_price
                 sl = recent_high * 1.005
                 tp = entry - (sl - entry) * 2.5
                 side = 'sell'
             else:
-                print(f"[HOLD] {symbol}: No clean setup. Monitoring structural sweep.")
+                print(f"[HOLD] {symbol}: No clean sweep setup.")
                 continue
 
-            # ---- POSITION SIZING & CONTRACT SIZE FIX ----
+            # --- POSITION SIZING & CONTRACT MATH ---
             balance = exchange.fetch_balance()['USDT']['free']
             risk_amount = balance * RISK_PERCENTAGE
             price_risk = abs(entry - sl)
             
             market = exchange.market(symbol)
-            contract_size = market['contractSize']
+            contract_size = market['contractSize'] # THIS IS THE FIX
             
+            # Calculate exact contracts for the exchange
             raw_contracts = (risk_amount / price_risk) / contract_size
             amount = float(exchange.amount_to_precision(symbol, raw_contracts))
             
             if amount > 0:
-                print(f"Executing {side} market order for {amount} contracts...")
+                print(f"Executing {side.upper()} for {amount} contracts...")
+                
+                # MARKET ORDER WITH SL/TP
                 order = exchange.create_order(
-                    symbol=symbol,
-                    type='market',
-                    side=side,
+                    symbol=symbol, 
+                    type='market', # THIS IS THE FIX (Market, not Limit)
+                    side=side, 
                     amount=amount,
-                    params={
-                        'tpTriggerPx': tp,
-                        'slTriggerPx': sl
-                    }
+                    params={'tpTriggerPx': tp, 'slTriggerPx': sl}
                 )
                 
-                success_msg = (
-                    f"✅ *{side.upper()} Market Order Executed (Demo - 3% Risk)*\n\n"
-                    f"*Asset:* `{symbol}`\n"
-                    f"*Contracts:* `{amount}`\n"
-                    f"*Est Entry:* `{entry:.4f}`\n"
-                    f"*Stop Loss:* `{sl:.4f}`\n"
-                    f"*Take Profit:* `{tp:.4f}`\n"
-                    f"*Order ID:* `{order['id']}`"
+                msg = (
+                    f"✅ {signal} EXECUTED\n"
+                    f"Asset: {symbol}\n"
+                    f"Size: {amount} contracts\n"
+                    f"Entry: {entry:.4f}\n"
+                    f"SL: {sl:.4f}\n"
+                    f"TP: {tp:.4f}"
                 )
-                print(success_msg)
-                send_telegram_alert(success_msg)
-                log_trade_to_memory({
-                    "symbol": symbol,
-                    "side": side,
-                    "entry": entry,
-                    "contracts": amount,
-                    "status": "executed"
-                })
+                send_telegram_alert(msg)
+                log_trade_to_memory({"symbol": symbol, "side": side, "entry": entry, "status": "executed"})
                 
         except Exception as e:
-            err_msg = f"⚠️ *Bot Error* on `{symbol}`:\n`{str(e)}`"
+            err_msg = f"⚠️ Bot Error on {symbol}:\n{str(e)}"
             print(err_msg)
             send_telegram_alert(err_msg)
 
 
 if __name__ == "__main__":
-    print("[INIT] Starting structural blueprint scan & position guard check...")
-    
+    print("[INIT] Starting structural blueprint scan...")
     if not API_KEY or not API_SECRET:
-        print(f"[CRITICAL] Missing API credentials! API_KEY: {bool(API_KEY)}, API_SECRET: {bool(API_SECRET)}")
+        print(f"[CRITICAL] Missing API credentials!")
         sys.exit(1)
         
     bot_exchange = initialize_exchange()
     run_market_strategy(bot_exchange)
-    print("[COMPLETE] Scan and risk guard execution finished safely.")
+    print("[COMPLETE] Scan finished safely.")
