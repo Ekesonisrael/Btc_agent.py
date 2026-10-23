@@ -32,10 +32,10 @@ jobs:
       - name: Run Trading Bot Script
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET: ${{ secrets.OKX_API_SECRET }}
-          OKX_API_SECRET: ${{ secrets.OKX_API_SECRET }}
+          OKX_SECRET: ${{ secrets.OKX_SECRET }}
           OKX_PASSWORD: ${{ secrets.OKX_PASSWORD }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python trading_bot.py
+ 
