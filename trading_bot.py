@@ -4,10 +4,11 @@ import ccxt
 import requests
 
 # ==========================================
-# CONFIGURATION & CREDENTIALS
+# CONFIGURATION & CREDENTIALS (Bulletproof Fallbacks)
 # ==========================================
 API_KEY = os.getenv("OKX_API_KEY")
-API_SECRET = os.getenv("OKX_API_SECRET")
+# Check both possible secret environment variable names
+API_SECRET = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET")
 API_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -109,7 +110,7 @@ if __name__ == "__main__":
     print("[INIT] Starting structural blueprint scan & outcome check...")
     
     if not API_KEY or not API_SECRET:
-        print("[CRITICAL] Missing API credentials in environment variables!")
+        print(f"[CRITICAL] Missing API credentials! API_KEY present: {bool(API_KEY)}, API_SECRET present: {bool(API_SECRET)}")
         sys.exit(1)
         
     bot_exchange = initialize_exchange()
