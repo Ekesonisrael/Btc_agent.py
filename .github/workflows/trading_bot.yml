@@ -2,7 +2,7 @@ name: OKX Trading Bot Execution
 
 concurrency:
   group: trading-bot-lock
-  cancel-in-concurrency: false
+  cancel-in-progress: false
 
 on:
   schedule:
