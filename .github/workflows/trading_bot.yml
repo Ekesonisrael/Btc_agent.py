@@ -2,8 +2,10 @@ name: OKX Trading Bot Execution
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
-  workflow_dispatch: 
+    - cron: '*/15 * * * *'  # GitHub's built-in schedule (kept as primary/backup)
+  repository_dispatch:
+    types: [trigger-bot]    # Allows external ping from cron-job.org
+  workflow_dispatch:        # Allows manual run
 
 jobs:
   run-bot:
@@ -26,7 +28,7 @@ jobs:
       - name: Run Trading Bot Script
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSWORD: ${{ secrets.OKX_PASSWORD }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
