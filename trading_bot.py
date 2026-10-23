@@ -4,17 +4,17 @@ import ccxt
 import requests
 
 # ==========================================
-# CONFIGURATION & CREDENTIALS (Bulletproof Fallbacks)
+# CONFIGURATION & CREDENTIALS
 # ==========================================
 API_KEY = os.getenv("OKX_API_KEY")
-# Check both possible secret environment variable names
-API_SECRET = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET")
+API_SECRET = os.getenv("OKX_SECRET")  # Matches your exact GitHub Secret name
 API_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 3
+RISK_PERCENTAGE = 0.05  # 5% Risk per trade
 
 
 def send_telegram_alert(message):
