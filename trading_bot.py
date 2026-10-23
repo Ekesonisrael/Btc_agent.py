@@ -1,6 +1,7 @@
 import os
 import requests
 import ccxt
+from datetime import datetime, timezone
 
 # ==========================================
 # 1. CONFIGURATION & SECRETS
@@ -36,32 +37,68 @@ exchange = ccxt.okx({
 exchange.set_sandbox_mode(True)
 
 SYMBOLS = ['BTC/USDT:USDT', 'SOL/USDT:USDT']
-RISK_PERCENTAGE = 0.05  # 5% Risk per trade model
+RISK_PERCENTAGE = 0.05  # 5% Risk model
 LEVERAGE = 3
 
 def initialize_market(symbol):
     try:
         exchange.set_margin_mode('isolated', symbol)
         exchange.set_leverage(LEVERAGE, symbol)
-        print(f"[SETUP] {symbol} configured for Isolated Margin @ {LEVERAGE}x.")
     except Exception as e:
         print(f"[SETUP NOTICE] {symbol}: {e}")
 
 # ==========================================
-# 2. THE BLUEPRINT STRATEGY ENGINE
+# 2. TRADE OUTCOME & SUMMARY TRACKER
+# ==========================================
+def check_recent_trade_outcomes():
+    """Checks OKX for recently closed orders and sends a post-mortem summary to Telegram."""
+    print("--- Checking Recent Trade Outcomes & History ---")
+    for symbol in SYMBOLS:
+        try:
+            # Fetch closed orders from OKX
+            closed_orders = exchange.fetch_closed_orders(symbol, limit=3)
+            
+            for order in closed_orders:
+                status = order.get('status')
+                order_type = order.get('type')
+                side = order.get('side')
+                price = order.get('price')
+                filled_amount = order.get('filled', 0)
+                
+                # If an order was closed/filled recently (within the last 20 minutes)
+                order_timestamp = order.get('timestamp', 0) / 1000 # Convert ms to seconds
+                current_time = datetime.now(timezone.utc).timestamp()
+                
+                # Check if it closed within the last 20 minutes (1200 seconds)
+                if (current_time - order_timestamp) < 1200 and status == 'closed':
+                    summary_msg = (
+                        f"📊 *TRADE OUTCOME SUMMARY*\n\n"
+                        f"*Asset:* `{symbol}`\n"
+                        f"*Type:* `{side.upper()} {order_type.upper()}`\n"
+                        f"*Status:* `CLOSED / FILLED`\n"
+                        f"*Execution Price:* `{price}`\n"
+                        f"*Size:* `{filled_amount}`\n"
+                        f"*Time:* `{datetime.fromtimestamp(order_timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC`\n\n"
+                        f"🔍 *Review:* Order completed on OKX demo environment. Check your journal to log emotions and setup accuracy."
+                    )
+                    print(f"[REPORT] Sending outcome summary for {symbol}")
+                    send_telegram_alert(summary_msg)
+                    
+        except Exception as e:
+            print(f"[ERROR checking history for {symbol}]: {e}")
+
+# ==========================================
+# 3. THE BLUEPRINT STRATEGY ENGINE
 # ==========================================
 def execute_strategy():
     print("--- Running Market Structure & Liquidity Sweep Scan ---")
     
     for symbol in SYMBOLS:
         try:
-            # ==========================================
-            # STEP A: 4H MACRO TREND BIAS (The Foundation)
-            # ==========================================
+            # A. 4H MACRO TREND BIAS
             ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=10)
             closes_4h = [c[4] for c in ohlcv_4h]
             
-            # Check if 4H is making higher highs / higher lows (Bullish Macro Bias)
             is_macro_bullish = closes_4h[-1] > closes_4h[-3] and closes_4h[-3] > closes_4h[-5]
             is_macro_bearish = closes_4h[-1] < closes_4h[-3] and closes_4h[-3] < closes_4h[-5]
             
@@ -69,48 +106,34 @@ def execute_strategy():
                 print(f"[HOLD] {symbol}: 4H macro trend is consolidating. Sitting on hands.")
                 continue
 
-            # ==========================================
-            # STEP B: 15m EXECUTION & LIQUIDITY SWEEP
-# ==========================================
+            # B. 15m EXECUTION & LIQUIDITY SWEEP
             ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
-            timestamps = [c[0] for c in ohlcv_15m]
-            opens = [c[1] for c in ohlcv_15m]
             highs = [c[2] for c in ohlcv_15m]
             lows = [c[3] for c in ohlcv_15m]
             closes = [c[4] for c in ohlcv_15m]
+            opens = [c[1] for c in ohlcv_15m]
             
             current_price = closes[-1]
             
             if is_macro_bullish:
-                # Look for a Long Setup: Liquidity sweep below a recent low, followed by a bullish shift
-                recent_low = min(lows[-10:-2]) # Lowest point of recent range
-                swept_liquidity = lows[-2] < recent_low # Previous candle dipped below the low
-                bullish_shift = closes[-1] > opens[-1] and closes[-1] > highs[-2] # Strong close back up
+                recent_low = min(lows[-10:-2])
+                swept_liquidity = lows[-2] < recent_low
+                bullish_shift = closes[-1] > opens[-1] and closes[-1] > highs[-2]
                 
                 if swept_liquidity and bullish_shift:
                     print(f"🚨 *BULLISH LIQUIDITY SWEEP DETECTED* on {symbol}")
                     
-                    # ==========================================
-                    # STEP C: RISK MANAGEMENT & EXPLICIT SL / TP
-                    # ==========================================
                     entry_price = current_price
-                    # Stop-Loss placed precisely below the swept low (Structural Protection)
                     stop_loss = recent_low * 0.995 
-                    
                     risk_per_unit = entry_price - stop_loss
                     if risk_per_unit <= 0:
                         continue
                         
-                    # 1:3 Risk-to-Reward Ratio Target (Strict Discipline)
                     take_profit = entry_price + (risk_per_unit * 3.0)
                     
-                    # ==========================================
-                    # STEP D: POSITION SIZING & OKX EXECUTION
-                    # ==========================================
                     balance = exchange.fetch_balance()['USDT']['free']
                     risk_amount = balance * RISK_PERCENTAGE
                     raw_size = risk_amount / risk_per_unit
-                    
                     amount = float(exchange.amount_to_precision(symbol, raw_size))
                     
                     if amount > 0:
@@ -131,19 +154,17 @@ def execute_strategy():
                             f"*Asset:* `{symbol}`\n"
                             f"*Strategy:* 4H Trend + 15m Sweep\n"
                             f"*Entry Price:* `{entry_price}`\n"
-                            f"*Stop-Loss:* `{stop_loss:.2f}` *(Structural)*\n"
+                            f"*Stop-Loss:* `{stop_loss:.2f}`\n"
                             f"*Take-Profit:* `{take_profit:.2f}` *(1:3 R:R)*\n"
-                            f"*Risk Allocated:* `5%`\n"
-                            f"*Position Size:* `{amount}`\n"
+                            f"*Risk:* `5%` | *Size:* `{amount}`\n"
                             f"*Order ID:* `{order['id']}`"
                         )
                         print(signal_report)
                         send_telegram_alert(signal_report)
                 else:
-                    print(f"[WAIT] {symbol}: Waiting for clean 15m liquidity sweep in bullish 4H trend.")
+                    print(f"[WAIT] {symbol}: Waiting for clean 15m sweep in bullish 4H trend.")
                     
             elif is_macro_bearish:
-                # Look for a Short Setup: Liquidity sweep above a recent high, followed by a bearish shift
                 recent_high = max(highs[-10:-2])
                 swept_liquidity = highs[-2] > recent_high
                 bearish_shift = closes[-1] < opens[-1] and closes[-1] < lows[-2]
@@ -152,18 +173,16 @@ def execute_strategy():
                     print(f"🚨 *BEARISH LIQUIDITY SWEEP DETECTED* on {symbol}")
                     
                     entry_price = current_price
-                    stop_loss = recent_high * 1.005  # Structural Stop-Loss above high
-                    
+                    stop_loss = recent_high * 1.005
                     risk_per_unit = stop_loss - entry_price
                     if risk_per_unit <= 0:
                         continue
                         
-                    take_profit = entry_price - (risk_per_unit * 3.0) # 1:3 R:R Target
+                    take_profit = entry_price - (risk_per_unit * 3.0)
                     
                     balance = exchange.fetch_balance()['USDT']['free']
                     risk_amount = balance * RISK_PERCENTAGE
                     raw_size = risk_amount / risk_per_unit
-                    
                     amount = float(exchange.amount_to_precision(symbol, raw_size))
                     
                     if amount > 0:
@@ -184,16 +203,15 @@ def execute_strategy():
                             f"*Asset:* `{symbol}`\n"
                             f"*Strategy:* 4H Trend + 15m Sweep\n"
                             f"*Entry Price:* `{entry_price}`\n"
-                            f"*Stop-Loss:* `{stop_loss:.2f}` *(Structural)*\n"
+                            f"*Stop-Loss:* `{stop_loss:.2f}`\n"
                             f"*Take-Profit:* `{take_profit:.2f}` *(1:3 R:R)*\n"
-                            f"*Risk Allocated:* `5%`\n"
-                            f"*Position Size:* `{amount}`\n"
+                            f"*Risk:* `5%` | *Size:* `{amount}`\n"
                             f"*Order ID:* `{order['id']}`"
                         )
                         print(signal_report)
                         send_telegram_alert(signal_report)
                 else:
-                    print(f"[WAIT] {symbol}: Waiting for clean 15m liquidity sweep in bearish 4H trend.")
+                    print(f"[WAIT] {symbol}: Waiting for clean 15m sweep in bearish 4H trend.")
                     
         except Exception as e:
             err_msg = f"⚠️ *Execution Error on {symbol}:* `{e}`"
@@ -201,8 +219,13 @@ def execute_strategy():
             send_telegram_alert(err_msg)
 
 if __name__ == "__main__":
-    print("\n[INIT] Starting structural blueprint scan...")
+    print("\n[INIT] Starting structural blueprint scan & outcome check...")
     for sym in SYMBOLS:
         initialize_market(sym)
+        
+    # 1. Check if any previous trades finished or hit targets
+    check_recent_trade_outcomes()
+    
+    # 2. Scan for new setups
     execute_strategy()
-    print("[COMPLETE] Scan finished safely.")
+    print("[COMPLETE] Scan and review finished safely.")
