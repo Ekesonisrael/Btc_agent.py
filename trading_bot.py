@@ -123,7 +123,7 @@ def run_market_strategy(exchange, journal):
             swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
             swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
-            # ✅ THE FIX: Fetch the LIVE price right before executing
+            # ✅ FIX: Fetch live price only when a setup is found
             if (is_bullish and swept_low) or (is_bearish and swept_high):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
                 
@@ -140,12 +140,10 @@ def run_market_strategy(exchange, journal):
                     sl = recent_high * 1.005
                     tp = entry - (sl - entry) * 2.5
 
-                # Double-check safety
+                # Safety check to prevent OKX rejection
                 if side == 'buy' and tp <= entry:
-                    print(f"[SKIP] {symbol}: TP logic failed (would be below entry).")
                     continue
                 if side == 'sell' and tp >= entry:
-                    print(f"[SKIP] {symbol}: TP logic failed (would be above entry).")
                     continue
 
                 balance = exchange.fetch_balance()['USDT']['free']
@@ -197,4 +195,3 @@ if __name__ == "__main__":
     run_market_strategy(bot_exchange, journal)
     save_journal(journal) 
     print("[COMPLETE] Scan finished.")
-                    
