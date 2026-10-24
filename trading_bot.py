@@ -22,7 +22,6 @@ JOURNAL_FILE = "trade_journal.json"
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TELEGRAM] (Skipped) {message}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -54,13 +53,12 @@ def initialize_exchange():
         ex.load_markets()
         return ex
     except Exception as e:
-        print(f"[CRITICAL ERROR] Failed to initialize: {e}")
+        print(f"[CRITICAL ERROR] {e}")
         sys.exit(1)
 
 def setup_market_leverage(exchange, symbol):
     try:
         exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'cross'})
-        print(f"[SETUP] {symbol}: Leverage configured to {LEVERAGE}x Cross.")
     except Exception as e:
         print(f"[SETUP NOTICE] {symbol}: {e}")
 
@@ -76,40 +74,24 @@ def check_closed_trades(exchange, journal):
                 if not has_position:
                     since_time = int(datetime.fromisoformat(trade["time"]).timestamp() * 1000) - 60000
                     my_trades = exchange.fetch_my_trades(symbol, since=since_time)
-                    
                     exit_price = None
                     for t in my_trades:
                         if t['side'] != trade['side']:
                             exit_price = t['price']
                             break
-                    
                     if exit_price is None:
                         exit_price = float(trade['entry'])
-                        
                     entry = float(trade['entry'])
                     amount = float(trade['amount'])
-                    
-                    if trade['side'] == 'buy':
-                        pnl = (exit_price - entry) * amount
-                    else:
-                        pnl = (entry - exit_price) * amount
-                        
+                    pnl = (exit_price - entry) * amount if trade['side'] == 'buy' else (entry - exit_price) * amount
                     trade["status"] = "CLOSED"
                     trade["exit"] = exit_price
                     trade["pnl"] = round(pnl, 2)
                     updated = True
-                    
                     result = "PROFIT 🟢" if pnl > 0 else "LOSS 🔴"
-                    msg = (
-                        f"🔔 TRADE CLOSED: {symbol}\n"
-                        f"Result: {result}\n"
-                        f"Entry: {entry:.4f}\n"
-                        f"Exit: {exit_price:.4f}\n"
-                        f"PnL: {pnl:.2f} USDT"
-                    )
-                    send_telegram_alert(msg)
+                    send_telegram_alert(f"🔔 TRADE CLOSED: {symbol}\n{result}\nPnL: {pnl:.2f} USDT")
             except Exception as e:
-                print(f"[ERROR] Checking closed trade for {symbol}: {e}")
+                pass
     return updated
 
 def run_market_strategy(exchange, journal):
@@ -119,9 +101,7 @@ def run_market_strategy(exchange, journal):
         try:
             setup_market_leverage(exchange, symbol)
             
-            has_open_trade = any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal)
-            if has_open_trade:
-                print(f"[GUARD] Journal shows an open trade for {symbol}. Skipping.")
+            if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
                 continue
 
             ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
@@ -143,88 +123,78 @@ def run_market_strategy(exchange, journal):
             swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
             swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
-            signal = None
-            if is_bullish and swept_low:
-                signal = "LONG"
-                entry = current_price
-                sl = recent_low * 0.995
-                tp = entry + (entry - sl) * 2.5
-                side = 'buy'
-            elif is_bearish and swept_high:
-                signal = "SHORT"
-                entry = current_price
-                sl = recent_high * 1.005
-                tp = entry - (sl - entry) * 2.5
-                side = 'sell'
+            # ✅ THE FIX: Fetch the LIVE price right before executing
+            if (is_bullish and swept_low) or (is_bearish and swept_high):
+                live_price = float(exchange.fetch_ticker(symbol)['last'])
+                
+                if is_bullish and swept_low:
+                    signal = "LONG"
+                    side = 'buy'
+                    entry = live_price
+                    sl = recent_low * 0.995
+                    tp = entry + (entry - sl) * 2.5
+                else:
+                    signal = "SHORT"
+                    side = 'sell'
+                    entry = live_price
+                    sl = recent_high * 1.005
+                    tp = entry - (sl - entry) * 2.5
+
+                # Double-check safety
+                if side == 'buy' and tp <= entry:
+                    print(f"[SKIP] {symbol}: TP logic failed (would be below entry).")
+                    continue
+                if side == 'sell' and tp >= entry:
+                    print(f"[SKIP] {symbol}: TP logic failed (would be above entry).")
+                    continue
+
+                balance = exchange.fetch_balance()['USDT']['free']
+                risk_amount = balance * RISK_PERCENTAGE
+                price_risk = abs(entry - sl)
+                
+                market = exchange.market(symbol)
+                contract_size = market['contractSize']
+                
+                raw_contracts = (risk_amount / price_risk) / contract_size
+                amount = float(exchange.amount_to_precision(symbol, raw_contracts))
+                
+                if amount > 0:
+                    print(f"Executing {side.upper()} for {amount} contracts...")
+                    params = {
+                        'slTriggerPx': str(round(sl, 4)),
+                        'slOrdPx': '-1',
+                        'tpTriggerPx': str(round(tp, 4)),
+                        'tpOrdPx': '-1'
+                    }
+                    exchange.create_order(symbol, 'market', side, amount, params=params)
+                    
+                    journal.append({
+                        "symbol": symbol, "side": side, "entry": float(entry),
+                        "sl": float(sl), "tp": float(tp), "amount": float(amount),
+                        "status": "OPEN", "time": datetime.now().isoformat()
+                    })
+                    
+                    send_telegram_alert(
+                        f"✅ {signal} EXECUTED\n"
+                        f"Asset: {symbol}\n"
+                        f"Size: {amount} contracts\n"
+                        f"Entry: {entry:.4f}\n"
+                        f"SL: {sl:.4f}\n"
+                        f"TP: {tp:.4f}"
+                    )
             else:
                 print(f"[HOLD] {symbol}: No clean sweep setup.")
-                continue
-
-            balance = exchange.fetch_balance()['USDT']['free']
-            risk_amount = balance * RISK_PERCENTAGE
-            price_risk = abs(entry - sl)
-            
-            market = exchange.market(symbol)
-            contract_size = market['contractSize']
-            
-            raw_contracts = (risk_amount / price_risk) / contract_size
-            amount = float(exchange.amount_to_precision(symbol, raw_contracts))
-            
-            if amount > 0:
-                print(f"Executing {side.upper()} for {amount} contracts...")
-                
-                # ✅ THE FIX: Explicit OKX V5 parameters for TP/SL execution
-                params = {
-                    'slTriggerPx': str(round(sl, 4)),
-                    'slOrdPx': '-1',  # -1 means Market execution when SL is hit
-                    'tpTriggerPx': str(round(tp, 4)),
-                    'tpOrdPx': '-1'   # -1 means Market execution when TP is hit
-                }
-                
-                order = exchange.create_order(
-                    symbol=symbol, 
-                    type='market', 
-                    side=side, 
-                    amount=amount, 
-                    params=params
-                )
-                
-                journal.append({
-                    "symbol": symbol,
-                    "side": side,
-                    "entry": float(entry),
-                    "sl": float(sl),
-                    "tp": float(tp),
-                    "amount": float(amount),
-                    "status": "OPEN",
-                    "time": datetime.now().isoformat()
-                })
-                
-                msg = (
-                    f"✅ {signal} EXECUTED\n"
-                    f"Asset: {symbol}\n"
-                    f"Size: {float(amount)} contracts\n"
-                    f"Entry: {float(entry):.4f}\n"
-                    f"SL: {float(sl):.4f}\n"
-                    f"TP: {float(tp):.4f}"
-                )
-                send_telegram_alert(msg)
                 
         except Exception as e:
-            err_msg = f"⚠️ Execution Error on {symbol}:\n{str(e)}"
-            print(err_msg)
-            send_telegram_alert(err_msg)
+            send_telegram_alert(f"⚠️ Error on {symbol}:\n{str(e)}")
 
 if __name__ == "__main__":
-    print("[INIT] Starting structural blueprint scan...")
+    print("[INIT] Starting scan...")
     bot_exchange = initialize_exchange()
-    
     journal = load_journal()
-    
-    closed_something = check_closed_trades(bot_exchange, journal)
-    if closed_something:
+    if check_closed_trades(bot_exchange, journal):
         save_journal(journal)
-        
     run_market_strategy(bot_exchange, journal)
     save_journal(journal) 
-    print("[COMPLETE] Scan finished safely.")
+    print("[COMPLETE] Scan finished.")
+                    
