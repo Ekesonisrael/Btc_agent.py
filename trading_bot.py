@@ -4,10 +4,10 @@ import json
 import ccxt
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ==========================================
-# CONFIGURATION & SECRETS
+# CONFIGURATION & SECRETS (OKX)
 # ==========================================
 API_KEY = os.getenv("OKX_API_KEY")
 API_SECRET = os.getenv("OKX_SECRET")
@@ -22,6 +22,7 @@ JOURNAL_FILE = "trade_journal.json"
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[TELEGRAM] (Skipped) {message}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -49,7 +50,7 @@ def initialize_exchange():
             'apiKey': API_KEY, 'secret': API_SECRET, 'password': API_PASSWORD,
             'enableRateLimit': True, 'options': {'defaultType': 'swap'}
         })
-        ex.set_sandbox_mode(True)
+        ex.set_sandbox_mode(True) # DEMO MODE
         ex.load_markets()
         return ex
     except Exception as e:
@@ -63,35 +64,64 @@ def setup_market_leverage(exchange, symbol):
         print(f"[SETUP NOTICE] {symbol}: {e}")
 
 def check_closed_trades(exchange, journal):
+    """
+    The Autopsy Agent: Checks OKX history to calculate exact PnL and % move 
+    for any trade marked as OPEN that is no longer active.
+    """
     updated = False
     for trade in journal:
         if trade.get("status") == "OPEN":
             symbol = trade["symbol"]
             try:
+                # 1. Ask OKX if the position is still open
                 positions = exchange.fetch_positions([symbol])
                 has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
                 
                 if not has_position:
+                    # 2. The trade closed! Find the exact exit deal.
                     since_time = int(datetime.fromisoformat(trade["time"]).timestamp() * 1000) - 60000
                     my_trades = exchange.fetch_my_trades(symbol, since=since_time)
-                    exit_price = None
+                    
+                    exit_price = float(trade['entry']) # Fallback
                     for t in my_trades:
+                        # Find the opposite side trade (the exit)
                         if t['side'] != trade['side']:
                             exit_price = t['price']
                             break
-                    if exit_price is None:
-                        exit_price = float(trade['entry'])
+                            
                     entry = float(trade['entry'])
                     amount = float(trade['amount'])
-                    pnl = (exit_price - entry) * amount if trade['side'] == 'buy' else (entry - exit_price) * amount
+                    
+                    # 3. Calculate precise Math
+                    if trade['side'] == 'buy':
+                        pnl = (exit_price - entry) * amount
+                        pct_move = ((exit_price - entry) / entry) * 100
+                    else:
+                        pnl = (entry - exit_price) * amount
+                        pct_move = ((entry - exit_price) / entry) * 100
+                        
+                    result_emoji = "🟢 WIN" if pnl > 0 else "🔴 LOSS"
+                    
+                    # 4. Send the beautiful report
+                    report = (
+                        f"🔔 *TRADE CLOSED: {symbol}*\n\n"
+                        f"Result: {result_emoji}\n"
+                        f"Side: {'LONG' if trade['side'] == 'buy' else 'SHORT'}\n"
+                        f"Entry: ${entry:.4f}\n"
+                        f"Exit: ${exit_price:.4f}\n"
+                        f"Move: {pct_move:+.2f}%\n"
+                        f"PnL: ${pnl:+.2f} USDT\n\n"
+                        f"🧠 Strategy: Liquidity Sweep"
+                    )
+                    send_telegram_alert(report)
+                    print(report)
+                    
                     trade["status"] = "CLOSED"
                     trade["exit"] = exit_price
                     trade["pnl"] = round(pnl, 2)
                     updated = True
-                    result = "PROFIT 🟢" if pnl > 0 else "LOSS 🔴"
-                    send_telegram_alert(f"🔔 TRADE CLOSED: {symbol}\n{result}\nPnL: {pnl:.2f} USDT")
             except Exception as e:
-                pass
+                print(f"[RESOLVER ERROR] {symbol}: {e}")
     return updated
 
 def run_market_strategy(exchange, journal):
@@ -101,7 +131,9 @@ def run_market_strategy(exchange, journal):
         try:
             setup_market_leverage(exchange, symbol)
             
+            # Skip if we already have an open trade
             if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
+                print(f"[GUARD] Open trade exists for {symbol}. Skipping.")
                 continue
 
             ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
@@ -123,7 +155,7 @@ def run_market_strategy(exchange, journal):
             swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
             swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
-            # ✅ FIX: Fetch live price only when a setup is found
+            # Fetch live price only when a setup is found
             if (is_bullish and swept_low) or (is_bearish and swept_high):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
                 
@@ -187,11 +219,16 @@ def run_market_strategy(exchange, journal):
             send_telegram_alert(f"⚠️ Error on {symbol}:\n{str(e)}")
 
 if __name__ == "__main__":
-    print("[INIT] Starting scan...")
+    print("[INIT] Starting OKX Scan...")
     bot_exchange = initialize_exchange()
     journal = load_journal()
+    
+    # 1. Check old trades and resolve them
     if check_closed_trades(bot_exchange, journal):
         save_journal(journal)
+        
+    # 2. Hunt for new trades
     run_market_strategy(bot_exchange, journal)
     save_journal(journal) 
+    
     print("[COMPLETE] Scan finished.")
