@@ -64,10 +64,7 @@ def setup_market_leverage(exchange, symbol):
         print(f"[SETUP NOTICE] {symbol}: {e}")
 
 def check_closed_trades(exchange, journal):
-    """
-    The Autopsy Agent: Checks OKX history to calculate exact PnL and % move 
-    for any trade marked as OPEN that is no longer active.
-    """
+    """Checks OKX history to calculate exact PnL and % move for closed trades."""
     updated = False
     for trade in journal:
         if trade.get("status") == "OPEN":
@@ -102,7 +99,7 @@ def check_closed_trades(exchange, journal):
                         
                     result_emoji = "🟢 WIN" if pnl > 0 else "🔴 LOSS"
                     
-                    # 4. Send the beautiful report
+                    # 4. Send the report
                     report = (
                         f"🔔 *TRADE CLOSED: {symbol}*\n\n"
                         f"Result: {result_emoji}\n"
@@ -131,7 +128,7 @@ def run_market_strategy(exchange, journal):
         try:
             setup_market_leverage(exchange, symbol)
             
-            # Skip if we already have an open trade
+            # Skip if we already have an open trade for this asset
             if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
                 print(f"[GUARD] Open trade exists for {symbol}. Skipping.")
                 continue
@@ -142,12 +139,13 @@ def run_market_strategy(exchange, journal):
             df_4h = pd.DataFrame(ohlcv_4h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             df_15m = pd.DataFrame(ohlcv_15m, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
+            # 4H Trend
             df_4h['ema20'] = df_4h['c'].ewm(span=20, adjust=False).mean()
             df_4h['ema50'] = df_4h['c'].ewm(span=50, adjust=False).mean()
-            
             is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
             is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
             
+            # 15M Sweep
             current_price = float(df_15m['c'].iloc[-1])
             recent_low = float(df_15m['l'].iloc[-20:-1].min())
             recent_high = float(df_15m['h'].iloc[-20:-1].max())
@@ -155,11 +153,11 @@ def run_market_strategy(exchange, journal):
             swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
             swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
-            # Fetch live price only when a setup is found
+            # Execute Trade
             if (is_bullish and swept_low) or (is_bearish and swept_high):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
                 
-                # Add a tiny safety buffer (0.1%) to ensure TP is always valid
+                # ✅ THE FIX: 0.1% Slippage Buffer
                 buffer = live_price * 0.001 
 
                 if is_bullish and swept_low:
@@ -167,13 +165,13 @@ def run_market_strategy(exchange, journal):
                     side = 'buy'
                     entry = live_price
                     sl = recent_low * 0.995
-                    tp = entry + (entry - sl) * 2.5 + buffer
+                    tp = entry + (entry - sl) * 2.5 + buffer # Push TP higher
                 else:
                     signal = "SHORT"
                     side = 'sell'
                     entry = live_price
                     sl = recent_high * 1.005
-                    tp = entry - (sl - entry) * 2.5 - buffer
+                    tp = entry - (sl - entry) * 2.5 - buffer # Push TP lower
 
                 balance = exchange.fetch_balance()['USDT']['free']
                 risk_amount = balance * RISK_PERCENTAGE
@@ -188,15 +186,15 @@ def run_market_strategy(exchange, journal):
                 if amount > 0:
                     print(f"Executing {side.upper()} for {amount} contracts...")
                     
-                    # ✅ FIX: Use the correct CCXT nested parameters for OKX V5
+                    # ✅ THE FIX: Nested dictionaries for CCXT OKX V5
                     params = {
                         'stopLoss': {
                             'triggerPrice': float(exchange.price_to_precision(symbol, sl)),
-                            'price': -1 # -1 means market execution when SL is hit
+                            'price': -1 
                         },
                         'takeProfit': {
                             'triggerPrice': float(exchange.price_to_precision(symbol, tp)),
-                            'price': -1 # -1 means market execution when TP is hit
+                            'price': -1 
                         }
                     }
                     
@@ -220,7 +218,6 @@ def run_market_strategy(exchange, journal):
                 print(f"[HOLD] {symbol}: No clean sweep setup.")
                 
         except Exception as e:
-            # Log the full error for debugging
             print(f"[ORDER ERROR] {symbol}: {e}")
             send_telegram_alert(f"⚠️ Order Failed on {symbol}:\n{str(e)}")
 
