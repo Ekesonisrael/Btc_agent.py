@@ -159,24 +159,21 @@ def run_market_strategy(exchange, journal):
             if (is_bullish and swept_low) or (is_bearish and swept_high):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
                 
+                # Add a tiny safety buffer (0.1%) to ensure TP is always valid
+                buffer = live_price * 0.001 
+
                 if is_bullish and swept_low:
                     signal = "LONG"
                     side = 'buy'
                     entry = live_price
                     sl = recent_low * 0.995
-                    tp = entry + (entry - sl) * 2.5
+                    tp = entry + (entry - sl) * 2.5 + buffer
                 else:
                     signal = "SHORT"
                     side = 'sell'
                     entry = live_price
                     sl = recent_high * 1.005
-                    tp = entry - (sl - entry) * 2.5
-
-                # Safety check to prevent OKX rejection
-                if side == 'buy' and tp <= entry:
-                    continue
-                if side == 'sell' and tp >= entry:
-                    continue
+                    tp = entry - (sl - entry) * 2.5 - buffer
 
                 balance = exchange.fetch_balance()['USDT']['free']
                 risk_amount = balance * RISK_PERCENTAGE
@@ -190,12 +187,19 @@ def run_market_strategy(exchange, journal):
                 
                 if amount > 0:
                     print(f"Executing {side.upper()} for {amount} contracts...")
+                    
+                    # ✅ FIX: Use the correct CCXT nested parameters for OKX V5
                     params = {
-                        'slTriggerPx': str(round(sl, 4)),
-                        'slOrdPx': '-1',
-                        'tpTriggerPx': str(round(tp, 4)),
-                        'tpOrdPx': '-1'
+                        'stopLoss': {
+                            'triggerPrice': float(exchange.price_to_precision(symbol, sl)),
+                            'price': -1 # -1 means market execution when SL is hit
+                        },
+                        'takeProfit': {
+                            'triggerPrice': float(exchange.price_to_precision(symbol, tp)),
+                            'price': -1 # -1 means market execution when TP is hit
+                        }
                     }
+                    
                     exchange.create_order(symbol, 'market', side, amount, params=params)
                     
                     journal.append({
@@ -216,7 +220,9 @@ def run_market_strategy(exchange, journal):
                 print(f"[HOLD] {symbol}: No clean sweep setup.")
                 
         except Exception as e:
-            send_telegram_alert(f"⚠️ Error on {symbol}:\n{str(e)}")
+            # Log the full error for debugging
+            print(f"[ORDER ERROR] {symbol}: {e}")
+            send_telegram_alert(f"⚠️ Order Failed on {symbol}:\n{str(e)}")
 
 if __name__ == "__main__":
     print("[INIT] Starting OKX Scan...")
