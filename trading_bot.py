@@ -128,7 +128,6 @@ def run_market_strategy(exchange, journal):
         try:
             setup_market_leverage(exchange, symbol)
             
-            # Skip if we already have an open trade for this asset
             if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
                 print(f"[GUARD] Open trade exists for {symbol}. Skipping.")
                 continue
@@ -157,7 +156,7 @@ def run_market_strategy(exchange, journal):
             if (is_bullish and swept_low) or (is_bearish and swept_high):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
                 
-                # ✅ THE FIX: 0.1% Slippage Buffer
+                # 0.1% Slippage Buffer
                 buffer = live_price * 0.001 
 
                 if is_bullish and swept_low:
@@ -186,15 +185,13 @@ def run_market_strategy(exchange, journal):
                 if amount > 0:
                     print(f"Executing {side.upper()} for {amount} contracts...")
                     
-                    # ✅ THE FIX: Nested dictionaries for CCXT OKX V5
+                    # ✅ FIX: Omit the 'price' key to force Market execution on TP/SL
                     params = {
                         'stopLoss': {
-                            'triggerPrice': float(exchange.price_to_precision(symbol, sl)),
-                            'price': -1 
+                            'triggerPrice': float(exchange.price_to_precision(symbol, sl))
                         },
                         'takeProfit': {
-                            'triggerPrice': float(exchange.price_to_precision(symbol, tp)),
-                            'price': -1 
+                            'triggerPrice': float(exchange.price_to_precision(symbol, tp))
                         }
                     }
                     
@@ -226,11 +223,9 @@ if __name__ == "__main__":
     bot_exchange = initialize_exchange()
     journal = load_journal()
     
-    # 1. Check old trades and resolve them
     if check_closed_trades(bot_exchange, journal):
         save_journal(journal)
         
-    # 2. Hunt for new trades
     run_market_strategy(bot_exchange, journal)
     save_journal(journal) 
     
