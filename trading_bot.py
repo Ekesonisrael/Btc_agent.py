@@ -4,6 +4,7 @@ import json
 import ccxt
 import requests
 import pandas as pd
+import numpy as np # Added for ATR calculation
 from datetime import datetime, timezone, timedelta
 
 # ==========================================
@@ -19,6 +20,11 @@ SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 3
 RISK_PERCENTAGE = 0.03  # 3% Risk per trade
 JOURNAL_FILE = "trade_journal.json"
+
+# ✅ NEW WINNING PARAMETERS
+RISK_REWARD = 2.0
+ATR_MULTIPLIER = 1.5
+VOLUME_MULTIPLIER = 1.5
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -50,7 +56,7 @@ def initialize_exchange():
             'apiKey': API_KEY, 'secret': API_SECRET, 'password': API_PASSWORD,
             'enableRateLimit': True, 'options': {'defaultType': 'swap'}
         })
-        ex.set_sandbox_mode(True) # DEMO MODE
+        ex.set_sandbox_mode(True) # DEMO MODE (Set to False when ready for real money)
         ex.load_markets()
         return ex
     except Exception as e:
@@ -102,7 +108,7 @@ def check_closed_trades(exchange, journal):
                         f"Exit: ${exit_price:.4f}\n"
                         f"Move: {pct_move:+.2f}%\n"
                         f"PnL: ${pnl:+.2f} USDT\n\n"
-                        f"🧠 Strategy: Liquidity Sweep"
+                        f"🧠 Strategy: SMC Sweep (ATR Stops)"
                     )
                     send_telegram_alert(report)
                     print(report)
@@ -125,41 +131,64 @@ def run_market_strategy(exchange, journal):
             if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
                 continue
 
+            # Fetch 4H for Trend, 15M for Entry
             ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
             ohlcv_15m = exchange.fetch_ohlcv(symbol, '15m', limit=50)
             
             df_4h = pd.DataFrame(ohlcv_4h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             df_15m = pd.DataFrame(ohlcv_15m, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
+            # 4H Trend
             df_4h['ema20'] = df_4h['c'].ewm(span=20, adjust=False).mean()
             df_4h['ema50'] = df_4h['c'].ewm(span=50, adjust=False).mean()
-            
             is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
             is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
             
-            current_price = float(df_15m['c'].iloc[-1])
-            recent_low = float(df_15m['l'].iloc[-20:-1].min())
-            recent_high = float(df_15m['h'].iloc[-20:-1].max())
+            # ✅ NEW: Calculate ATR and Volume MA on 15M
+            high_low = df_15m['h'] - df_15m['l']
+            high_close = (df_15m['h'] - df_15m['c'].shift()).abs()
+            low_close = (df_15m['l'] - df_15m['c'].shift()).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            df_15m['atr'] = tr.rolling(window=14).mean()
+            df_15m['vol_ma'] = df_15m['v'].rolling(window=20).mean()
             
-            swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
-            swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
+            # ✅ NEW: We evaluate the PREVIOUS closed candle (-2) for the sweep
+            # and the LAST closed candle (-1) for confirmation.
+            sweep_candle = df_15m.iloc[-2]
+            conf_candle = df_15m.iloc[-1]
             
-            if (is_bullish and swept_low) or (is_bearish and swept_high):
+            recent_low = float(df_15m['l'].iloc[-20:-2].min())
+            recent_high = float(df_15m['h'].iloc[-20:-2].max())
+            
+            # Sweep Logic + Volume Filter
+            swept_low = (sweep_candle['l'] < recent_low) and (sweep_candle['c'] > recent_low) and (sweep_candle['v'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
+            swept_high = (sweep_candle['h'] > recent_high) and (sweep_candle['c'] < recent_high) and (sweep_candle['v'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
+            
+            # Confirmation (Green candle for Long, Red candle for Short)
+            confirm_long = conf_candle['c'] > conf_candle['o']
+            confirm_short = conf_candle['c'] < conf_candle['o']
+            
+            if (is_bullish and swept_low and confirm_long) or (is_bearish and swept_high and confirm_short):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
+                atr_value = float(sweep_candle['atr'])
                 buffer = live_price * 0.001 
 
                 if is_bullish and swept_low:
                     signal = "LONG"
                     side = 'buy'
                     entry = live_price
-                    sl = recent_low * 0.995
-                    tp = entry + (entry - sl) * 2.5 + buffer
+                    # ✅ NEW: ATR Stop Loss
+                    sl = entry - (atr_value * ATR_MULTIPLIER)
+                    risk = entry - sl
+                    tp = entry + (risk * RISK_REWARD) + buffer
                 else:
                     signal = "SHORT"
                     side = 'sell'
                     entry = live_price
-                    sl = recent_high * 1.005
-                    tp = entry - (sl - entry) * 2.5 - buffer
+                    # ✅ NEW: ATR Stop Loss
+                    sl = entry + (atr_value * ATR_MULTIPLIER)
+                    risk = sl - entry
+                    tp = entry - (risk * RISK_REWARD) - buffer
 
                 # Get current balance
                 balance = exchange.fetch_balance()['USDT']['free']
@@ -169,30 +198,27 @@ def run_market_strategy(exchange, journal):
                 market = exchange.market(symbol)
                 contract_size = market['contractSize']
                 
-                # Calculate Risk-Based Size
                 raw_contracts = (risk_amount / price_risk) / contract_size
                 
-                # ✅ THE FIX: Margin Cap Calculation
-                # Max position value we can afford with our leverage (leaving 10% buffer)
                 max_position_value = (balance * LEVERAGE) * 0.90
-                # Max contracts based on margin
                 max_contracts_margin = max_position_value / entry / contract_size
                 
-                # Use the smaller of the two sizes
                 final_contracts = min(raw_contracts, max_contracts_margin)
-                
                 amount = float(exchange.amount_to_precision(symbol, final_contracts))
                 
                 if amount > 0:
                     print(f"Executing {side.upper()} for {amount} contracts...")
                     
+                    # ✅ NEW: Added trailing stop (callbackRate) to mimic break-even
+                    # OKX uses a percentage callback rate. 1% is roughly our 1R trigger.
                     params = {
                         'stopLoss': {
                             'triggerPrice': float(exchange.price_to_precision(symbol, sl))
                         },
                         'takeProfit': {
                             'triggerPrice': float(exchange.price_to_precision(symbol, tp))
-                        }
+                        },
+                        'trailingPercent': 1.0 # Trails price by 1% after it moves in your favor
                     }
                     
                     exchange.create_order(symbol, 'market', side, amount, params=params)
@@ -208,11 +234,11 @@ def run_market_strategy(exchange, journal):
                         f"Asset: {symbol}\n"
                         f"Size: {amount} contracts\n"
                         f"Entry: {entry:.4f}\n"
-                        f"SL: {sl:.4f}\n"
+                        f"SL (ATR): {sl:.4f}\n"
                         f"TP: {tp:.4f}"
                     )
             else:
-                print(f"[HOLD] {symbol}: No clean sweep setup.")
+                print(f"[HOLD] {symbol}: No clean sweep + confirmation setup.")
                 
         except Exception as e:
             print(f"[ORDER ERROR] {symbol}: {e}")
