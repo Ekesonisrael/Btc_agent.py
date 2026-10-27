@@ -8,18 +8,17 @@ import time
 # ==========================================
 SYMBOLS = ['BTC/USDT:USDT', 'SOL/USDT:USDT']
 RISK_REWARD = 2.5
-BARS_1H = 3000  # Approx 4 months of 1H data
-BARS_4H = 1000  # Approx 160 days of 4h data
-FEE_RATE = 0.0005 # 0.05% per side (OKX Taker)
-SLIPPAGE = 0.0005 # 0.05% per side
+BARS_1H = 3000  
+BARS_4H = 1000  
+FEE_RATE = 0.0005 
+SLIPPAGE = 0.0005 
+ATR_MULTIPLIER = 1.5 # ✅ WIDER STOP LOSS
 
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
 def fetch_history(symbol, timeframe, limit):
-    print(f"Fetching {timeframe} for {symbol}...")
     all_ohlcv = []
     since = exchange.milliseconds() - (limit * exchange.parse_timeframe(timeframe) * 1000)
-    
     while True:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=100)
@@ -28,24 +27,28 @@ def fetch_history(symbol, timeframe, limit):
             since = ohlcv[-1][0] + 1
             if len(all_ohlcv) >= limit: break
             time.sleep(0.1)
-        except Exception as e:
-            print(f"Error: {e}")
-            break
-            
+        except Exception: break
     df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     return df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
 
 def run_backtest(symbol):
+    print(f"Fetching data for {symbol}...")
     df_4h = fetch_history(symbol, '4h', BARS_4H)
-    df_1h = fetch_history(symbol, '1h', BARS_1H) # ✅ CHANGED TO 1H
-    
+    df_1h = fetch_history(symbol, '1h', BARS_1H)
     if df_4h.empty or df_1h.empty: return
 
     # 4H Trend
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
+
+    # Calculate ATR on 1H
+    high_low = df_1h['high'] - df_1h['low']
+    high_close = (df_1h['high'] - df_1h['close'].shift()).abs()
+    low_close = (df_1h['low'] - df_1h['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df_1h['atr'] = tr.rolling(window=14).mean()
 
     # Merge
     df_1h = pd.merge_asof(df_1h, df_4h[['time', 'trend']], on='time', direction='backward')
@@ -66,9 +69,10 @@ def run_backtest(symbol):
         trade_entered = False
         side = None
         
+        # ✅ THE FIX: Use ATR to widen the stop loss
         if row['trend'] == 1 and row['swept_low']:
             entry = next_row['open']
-            sl = row['recent_low'] * 0.9995
+            sl = entry - (row['atr'] * ATR_MULTIPLIER) # Wide ATR Stop
             risk = entry - sl
             tp = entry + (risk * RISK_REWARD)
             trade_entered = True
@@ -76,7 +80,7 @@ def run_backtest(symbol):
             
         elif row['trend'] == -1 and row['swept_high']:
             entry = next_row['open']
-            sl = row['recent_high'] * 1.0005
+            sl = entry + (row['atr'] * ATR_MULTIPLIER) # Wide ATR Stop
             risk = sl - entry
             tp = entry - (risk * RISK_REWARD)
             trade_entered = True
@@ -86,7 +90,6 @@ def run_backtest(symbol):
             exit_idx = None
             result = None
             
-            # Calculate Trade Cost (Fees + Slippage) in price terms
             cost = (entry * (FEE_RATE + SLIPPAGE)) * 2
             cost_r = cost / risk
 
@@ -94,52 +97,28 @@ def run_backtest(symbol):
                 candle = df_1h.iloc[j]
                 
                 if side == 'LONG':
-                    if candle['low'] <= sl:
-                        result = 'LOSS'
-                        exit_idx = j
-                        break
-                    elif candle['high'] >= tp:
-                        result = 'WIN'
-                        exit_idx = j
-                        break
-                        
+                    if candle['low'] <= sl: result, exit_idx = 'LOSS', j; break
+                    elif candle['high'] >= tp: result, exit_idx = 'WIN', j; break
                 elif side == 'SHORT':
-                    if candle['high'] >= sl:
-                        result = 'LOSS'
-                        exit_idx = j
-                        break
-                    elif candle['low'] <= tp:
-                        result = 'WIN'
-                        exit_idx = j
-                        break
+                    if candle['high'] >= sl: result, exit_idx = 'LOSS', j; break
+                    elif candle['low'] <= tp: result, exit_idx = 'WIN', j; break
                         
             if exit_idx:
-                if result == 'WIN':
-                    net_r = RISK_REWARD - cost_r
-                else:
-                    net_r = -1.0 - cost_r
-                    
+                net_r = (RISK_REWARD if result == 'WIN' else -1.0) - cost_r
                 trades.append({'result': result, 'r': net_r})
                 i = exit_idx + 1 
-            else:
-                i += 1 
-        else:
-            i += 1
+            else: i += 1 
+        else: i += 1
 
     if not trades: return
 
     total = len(trades)
     wins = sum(1 for t in trades if t['result'] == 'WIN')
-    losses = sum(1 for t in trades if t['result'] == 'LOSS')
-    win_rate = (wins / total) * 100
     total_r = sum(t['r'] for t in trades)
     
-    print(f"\n=== {symbol} RESULTS (1H Chart, After Fees) ===")
-    print(f"Total Trades: {total}")
-    print(f"Wins: {wins} | Losses: {losses}")
-    print(f"Win Rate: {win_rate:.2f}%")
-    print(f"Total R: {total_r:+.2f}R")
-    print(f"Average R per trade: {(total_r/total):+.2f}R")
+    print(f"\n=== {symbol} RESULTS (ATR Stops, After Fees) ===")
+    print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
+    print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
 
 if __name__ == "__main__":
     for sym in SYMBOLS:
