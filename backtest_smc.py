@@ -8,7 +8,7 @@ import time
 # ==========================================
 SYMBOLS = ['BTC/USDT:USDT', 'SOL/USDT:USDT']
 RISK_REWARD = 2.5
-BARS_15M = 5000 # Approx 50 days of 15m data
+BARS_1H = 3000  # Approx 4 months of 1H data
 BARS_4H = 1000  # Approx 160 days of 4h data
 FEE_RATE = 0.0005 # 0.05% per side (OKX Taker)
 SLIPPAGE = 0.0005 # 0.05% per side
@@ -38,9 +38,9 @@ def fetch_history(symbol, timeframe, limit):
 
 def run_backtest(symbol):
     df_4h = fetch_history(symbol, '4h', BARS_4H)
-    df_15m = fetch_history(symbol, '15m', BARS_15M)
+    df_1h = fetch_history(symbol, '1h', BARS_1H) # ✅ CHANGED TO 1H
     
-    if df_4h.empty or df_15m.empty: return
+    if df_4h.empty or df_1h.empty: return
 
     # 4H Trend
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
@@ -48,20 +48,20 @@ def run_backtest(symbol):
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
 
     # Merge
-    df_15m = pd.merge_asof(df_15m, df_4h[['time', 'trend']], on='time', direction='backward')
-    df_15m['recent_low'] = df_15m['low'].rolling(window=20).min().shift(1)
-    df_15m['recent_high'] = df_15m['high'].rolling(window=20).max().shift(1)
+    df_1h = pd.merge_asof(df_1h, df_4h[['time', 'trend']], on='time', direction='backward')
+    df_1h['recent_low'] = df_1h['low'].rolling(window=20).min().shift(1)
+    df_1h['recent_high'] = df_1h['high'].rolling(window=20).max().shift(1)
 
     # Sweep Logic
-    df_15m['swept_low'] = (df_15m['low'] < df_15m['recent_low']) & (df_15m['close'] > df_15m['recent_low'])
-    df_15m['swept_high'] = (df_15m['high'] > df_15m['recent_high']) & (df_15m['close'] < df_15m['recent_high'])
+    df_1h['swept_low'] = (df_1h['low'] < df_1h['recent_low']) & (df_1h['close'] > df_1h['recent_low'])
+    df_1h['swept_high'] = (df_1h['high'] > df_1h['recent_high']) & (df_1h['close'] < df_1h['recent_high'])
 
     trades = []
     i = 20 
 
-    while i < len(df_15m) - 1:
-        row = df_15m.iloc[i]
-        next_row = df_15m.iloc[i+1]
+    while i < len(df_1h) - 1:
+        row = df_1h.iloc[i]
+        next_row = df_1h.iloc[i+1]
         
         trade_entered = False
         side = None
@@ -90,8 +90,8 @@ def run_backtest(symbol):
             cost = (entry * (FEE_RATE + SLIPPAGE)) * 2
             cost_r = cost / risk
 
-            for j in range(i+1, len(df_15m)):
-                candle = df_15m.iloc[j]
+            for j in range(i+1, len(df_1h)):
+                candle = df_1h.iloc[j]
                 
                 if side == 'LONG':
                     if candle['low'] <= sl:
@@ -114,7 +114,6 @@ def run_backtest(symbol):
                         break
                         
             if exit_idx:
-                # Deduct the cost from the R multiple
                 if result == 'WIN':
                     net_r = RISK_REWARD - cost_r
                 else:
@@ -135,7 +134,7 @@ def run_backtest(symbol):
     win_rate = (wins / total) * 100
     total_r = sum(t['r'] for t in trades)
     
-    print(f"\n=== {symbol} RESULTS (After Fees) ===")
+    print(f"\n=== {symbol} RESULTS (1H Chart, After Fees) ===")
     print(f"Total Trades: {total}")
     print(f"Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.2f}%")
