@@ -64,24 +64,20 @@ def setup_market_leverage(exchange, symbol):
         print(f"[SETUP NOTICE] {symbol}: {e}")
 
 def check_closed_trades(exchange, journal):
-    """Checks OKX history to calculate exact PnL and % move for closed trades."""
     updated = False
     for trade in journal:
         if trade.get("status") == "OPEN":
             symbol = trade["symbol"]
             try:
-                # 1. Ask OKX if the position is still open
                 positions = exchange.fetch_positions([symbol])
                 has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
                 
                 if not has_position:
-                    # 2. The trade closed! Find the exact exit deal.
                     since_time = int(datetime.fromisoformat(trade["time"]).timestamp() * 1000) - 60000
                     my_trades = exchange.fetch_my_trades(symbol, since=since_time)
                     
-                    exit_price = float(trade['entry']) # Fallback
+                    exit_price = float(trade['entry'])
                     for t in my_trades:
-                        # Find the opposite side trade (the exit)
                         if t['side'] != trade['side']:
                             exit_price = t['price']
                             break
@@ -89,7 +85,6 @@ def check_closed_trades(exchange, journal):
                     entry = float(trade['entry'])
                     amount = float(trade['amount'])
                     
-                    # 3. Calculate precise Math
                     if trade['side'] == 'buy':
                         pnl = (exit_price - entry) * amount
                         pct_move = ((exit_price - entry) / entry) * 100
@@ -99,7 +94,6 @@ def check_closed_trades(exchange, journal):
                         
                     result_emoji = "🟢 WIN" if pnl > 0 else "🔴 LOSS"
                     
-                    # 4. Send the report
                     report = (
                         f"🔔 *TRADE CLOSED: {symbol}*\n\n"
                         f"Result: {result_emoji}\n"
@@ -129,7 +123,6 @@ def run_market_strategy(exchange, journal):
             setup_market_leverage(exchange, symbol)
             
             if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
-                print(f"[GUARD] Open trade exists for {symbol}. Skipping.")
                 continue
 
             ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
@@ -138,13 +131,12 @@ def run_market_strategy(exchange, journal):
             df_4h = pd.DataFrame(ohlcv_4h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             df_15m = pd.DataFrame(ohlcv_15m, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # 4H Trend
             df_4h['ema20'] = df_4h['c'].ewm(span=20, adjust=False).mean()
             df_4h['ema50'] = df_4h['c'].ewm(span=50, adjust=False).mean()
+            
             is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
             is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
             
-            # 15M Sweep
             current_price = float(df_15m['c'].iloc[-1])
             recent_low = float(df_15m['l'].iloc[-20:-1].min())
             recent_high = float(df_15m['h'].iloc[-20:-1].max())
@@ -152,11 +144,8 @@ def run_market_strategy(exchange, journal):
             swept_low = df_15m['l'].iloc[-1] < recent_low and current_price > recent_low
             swept_high = df_15m['h'].iloc[-1] > recent_high and current_price < recent_high
             
-            # Execute Trade
             if (is_bullish and swept_low) or (is_bearish and swept_high):
                 live_price = float(exchange.fetch_ticker(symbol)['last'])
-                
-                # 0.1% Slippage Buffer
                 buffer = live_price * 0.001 
 
                 if is_bullish and swept_low:
@@ -164,14 +153,15 @@ def run_market_strategy(exchange, journal):
                     side = 'buy'
                     entry = live_price
                     sl = recent_low * 0.995
-                    tp = entry + (entry - sl) * 2.5 + buffer # Push TP higher
+                    tp = entry + (entry - sl) * 2.5 + buffer
                 else:
                     signal = "SHORT"
                     side = 'sell'
                     entry = live_price
                     sl = recent_high * 1.005
-                    tp = entry - (sl - entry) * 2.5 - buffer # Push TP lower
+                    tp = entry - (sl - entry) * 2.5 - buffer
 
+                # Get current balance
                 balance = exchange.fetch_balance()['USDT']['free']
                 risk_amount = balance * RISK_PERCENTAGE
                 price_risk = abs(entry - sl)
@@ -179,13 +169,23 @@ def run_market_strategy(exchange, journal):
                 market = exchange.market(symbol)
                 contract_size = market['contractSize']
                 
+                # Calculate Risk-Based Size
                 raw_contracts = (risk_amount / price_risk) / contract_size
-                amount = float(exchange.amount_to_precision(symbol, raw_contracts))
+                
+                # ✅ THE FIX: Margin Cap Calculation
+                # Max position value we can afford with our leverage (leaving 10% buffer)
+                max_position_value = (balance * LEVERAGE) * 0.90
+                # Max contracts based on margin
+                max_contracts_margin = max_position_value / entry / contract_size
+                
+                # Use the smaller of the two sizes
+                final_contracts = min(raw_contracts, max_contracts_margin)
+                
+                amount = float(exchange.amount_to_precision(symbol, final_contracts))
                 
                 if amount > 0:
                     print(f"Executing {side.upper()} for {amount} contracts...")
                     
-                    # ✅ FIX: Omit the 'price' key to force Market execution on TP/SL
                     params = {
                         'stopLoss': {
                             'triggerPrice': float(exchange.price_to_precision(symbol, sl))
