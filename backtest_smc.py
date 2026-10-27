@@ -10,6 +10,8 @@ SYMBOLS = ['BTC/USDT:USDT', 'SOL/USDT:USDT']
 RISK_REWARD = 2.5
 BARS_15M = 5000 # Approx 50 days of 15m data
 BARS_4H = 1000  # Approx 160 days of 4h data
+FEE_RATE = 0.0005 # 0.05% per side (OKX Taker)
+SLIPPAGE = 0.0005 # 0.05% per side
 
 exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
@@ -38,16 +40,14 @@ def run_backtest(symbol):
     df_4h = fetch_history(symbol, '4h', BARS_4H)
     df_15m = fetch_history(symbol, '15m', BARS_15M)
     
-    if df_4h.empty or df_15m.empty:
-        print(f"Data missing for {symbol}")
-        return
+    if df_4h.empty or df_15m.empty: return
 
-    # Calculate 4H Trend
+    # 4H Trend
     df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
 
-    # Merge Trend into 15M data
+    # Merge
     df_15m = pd.merge_asof(df_15m, df_4h[['time', 'trend']], on='time', direction='backward')
     df_15m['recent_low'] = df_15m['low'].rolling(window=20).min().shift(1)
     df_15m['recent_high'] = df_15m['high'].rolling(window=20).max().shift(1)
@@ -57,78 +57,85 @@ def run_backtest(symbol):
     df_15m['swept_high'] = (df_15m['high'] > df_15m['recent_high']) & (df_15m['close'] < df_15m['recent_high'])
 
     trades = []
-    i = 20 # Skip the warmup period for indicators
+    i = 20 
 
-    # ✅ FIXED LOOP
     while i < len(df_15m) - 1:
         row = df_15m.iloc[i]
         next_row = df_15m.iloc[i+1]
         
         trade_entered = False
+        side = None
         
-        # Long Setup
         if row['trend'] == 1 and row['swept_low']:
             entry = next_row['open']
             sl = row['recent_low'] * 0.9995
             risk = entry - sl
             tp = entry + (risk * RISK_REWARD)
             trade_entered = True
+            side = 'LONG'
             
-        # Short Setup
         elif row['trend'] == -1 and row['swept_high']:
             entry = next_row['open']
             sl = row['recent_high'] * 1.0005
             risk = sl - entry
             tp = entry - (risk * RISK_REWARD)
             trade_entered = True
+            side = 'SHORT'
 
         if trade_entered:
-            # Look forward to see if we hit TP or SL
             exit_idx = None
+            result = None
+            
+            # Calculate Trade Cost (Fees + Slippage) in price terms
+            cost = (entry * (FEE_RATE + SLIPPAGE)) * 2
+            cost_r = cost / risk
+
             for j in range(i+1, len(df_15m)):
                 candle = df_15m.iloc[j]
                 
-                # LONG exit check
-                if row['trend'] == 1 and row['swept_low']:
+                if side == 'LONG':
                     if candle['low'] <= sl:
-                        trades.append('LOSS')
+                        result = 'LOSS'
                         exit_idx = j
                         break
                     elif candle['high'] >= tp:
-                        trades.append('WIN')
+                        result = 'WIN'
                         exit_idx = j
                         break
                         
-                # SHORT exit check
-                elif row['trend'] == -1 and row['swept_high']:
+                elif side == 'SHORT':
                     if candle['high'] >= sl:
-                        trades.append('LOSS')
+                        result = 'LOSS'
                         exit_idx = j
                         break
                     elif candle['low'] <= tp:
-                        trades.append('WIN')
+                        result = 'WIN'
                         exit_idx = j
                         break
                         
             if exit_idx:
-                i = exit_idx + 1 # Jump to the candle after the trade closed
+                # Deduct the cost from the R multiple
+                if result == 'WIN':
+                    net_r = RISK_REWARD - cost_r
+                else:
+                    net_r = -1.0 - cost_r
+                    
+                trades.append({'result': result, 'r': net_r})
+                i = exit_idx + 1 
             else:
-                i += 1 # If trade never closed (ran out of data), just move forward
+                i += 1 
         else:
             i += 1
 
-    # Report
-    if not trades:
-        print(f"\n{symbol}: No trades found.")
-        return
+    if not trades: return
 
     total = len(trades)
-    wins = trades.count('WIN')
-    losses = trades.count('LOSS')
+    wins = sum(1 for t in trades if t['result'] == 'WIN')
+    losses = sum(1 for t in trades if t['result'] == 'LOSS')
     win_rate = (wins / total) * 100
-    total_r = (wins * RISK_REWARD) - (losses * 1.0)
+    total_r = sum(t['r'] for t in trades)
     
-    print(f"\n=== {symbol} RESULTS ===")
+    print(f"\n=== {symbol} RESULTS (After Fees) ===")
     print(f"Total Trades: {total}")
     print(f"Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.2f}%")
