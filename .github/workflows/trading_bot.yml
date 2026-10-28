@@ -2,15 +2,20 @@ name: BTC SMC Scanner
 
 on:
   schedule:
-    # Runs every 15 minutes (at :00, :15, :30, :45)
+    # Runs every 15 minutes
     - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual run from GitHub UI
+
+# REQUIRED to allow GitHub Actions to push the updated state.json back to the repo
+permissions:
+  contents: write
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -22,7 +27,17 @@ jobs:
           
       - name: Run Live Scanner
         env:
-          # Pulls these securely from your GitHub Repository Secrets
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python trading_bot.py
+        
+      - name: Commit State File
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          # If state.json exists, commit and push it
+          if [ -f state.json ]; then
+            git add state.json
+            git diff --quiet && git diff --staged --quiet || git commit -m "Update state.json [skip ci]"
+            git push
+          fi
