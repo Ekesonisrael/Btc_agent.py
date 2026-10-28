@@ -1,50 +1,28 @@
-name: OKX Trading Bot Execution
-
-concurrency:
-  group: trading-bot-lock
-  cancel-in-progress: false
+name: BTC SMC Scanner
 
 on:
   schedule:
+    # Runs every 15 minutes (at :00, :15, :30, :45)
     - cron: '*/15 * * * *'
-  repository_dispatch:
-    types: [trigger-bot]
-  workflow_dispatch:
-
-permissions:
-  contents: write
+  workflow_dispatch: # Allows manual run from GitHub UI
 
 jobs:
-  run-bot:
+  run-scanner:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Install Dependencies
+          python-version: "3.11"
+          
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt pandas requests
-
-      - name: Run Trading Bot Script
+          pip install requests pandas numpy
+          
+      - name: Run Live Scanner
         env:
-          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-          OKX_SECRET: ${{ secrets.OKX_SECRET }}
-          OKX_PASSWORD: ${{ secrets.OKX_PASSWORD }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          # Pulls these securely from your GitHub Repository Secrets
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python trading_bot.py
-          
-      - name: Commit and Save Journal
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add trade_journal.json || true
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update trade journal [skip ci]"
-          git push || true
