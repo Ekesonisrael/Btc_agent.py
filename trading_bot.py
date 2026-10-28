@@ -3,14 +3,17 @@ import requests
 import pandas as pd
 import numpy as np
 import os
+import json
+from datetime import datetime, timedelta
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & HARDENING
 # ==========================================
 SYMBOL = "BTC-USDT-SWAP"
 LEVERAGE = 3
 SL_BUFFER = 0.003  # 0.3% buffer distance
-RR_TARGET = 2.0    # 1:2 R:R target
+RR_TARGET = 2.5    # Bumped to 2.5 to absorb fees & funding drag
+STATE_FILE = "state.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -25,6 +28,37 @@ def send_telegram_alert(message):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"Telegram alert failed: {e}")
+
+# ==========================================
+# STATE MANAGEMENT (DUPLICATE PREVENTION)
+# ==========================================
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=4)
+
+def is_on_cooldown(signal_time_str):
+    state = load_state()
+    last_signal_time = state.get("last_signal_time")
+    
+    if not last_signal_time:
+        return False
+        
+    last_dt = pd.to_datetime(last_signal_time)
+    current_dt = pd.to_datetime(signal_time_str)
+    
+    # Enforce a strict 4-hour (16 candles) cooldown between alerts
+    if current_dt - last_dt < timedelta(hours=4):
+        return True
+    return False
 
 # ==========================================
 # RECENT DATA FETCH (OKX API)
@@ -52,10 +86,10 @@ def run_live_scanner():
         print("Failed to fetch candle data or insufficient history.")
         return
 
-    # Evaluate the most recently completed candle structure
     i = len(df) - 3
     sweep_candle = df.iloc[i]
     confirm_candle = df.iloc[i+1]
+    signal_timestamp = str(df.iloc[i+2]['ts'])
     ema = sweep_candle['ema_50']
     
     is_bullish_trend = sweep_candle['c'] >= ema
@@ -69,6 +103,10 @@ def run_live_scanner():
     is_long_disp = confirm_candle['c'] > confirm_candle['o'] and confirm_candle['c'] > sweep_candle['o']
     
     if is_bullish_trend and is_long_sweep and is_long_disp:
+        if is_on_cooldown(signal_timestamp):
+            print(f"[{SYMBOL}] Setup detected, but bot is on 4-hour cooldown. Skipping duplicate.")
+            return
+            
         entry_price = df.iloc[i+2]['o']
         sl = sweep_candle['l'] * (1.0 - SL_BUFFER)
         risk_distance = entry_price - sl
@@ -82,6 +120,7 @@ def run_live_scanner():
                 f"• *Mode:* `3x Isolated Margin`"
             )
             print(msg)
+            save_state({"last_signal_time": signal_timestamp}) # SAVE FIRST
             send_telegram_alert(msg)
             return
 
@@ -90,6 +129,10 @@ def run_live_scanner():
     is_short_disp = confirm_candle['c'] < confirm_candle['o'] and confirm_candle['c'] < sweep_candle['o']
     
     if is_bearish_trend and is_short_sweep and is_short_disp:
+        if is_on_cooldown(signal_timestamp):
+            print(f"[{SYMBOL}] Setup detected, but bot is on 4-hour cooldown. Skipping duplicate.")
+            return
+            
         entry_price = df.iloc[i+2]['o']
         sl = sweep_candle['h'] * (1.0 + SL_BUFFER)
         risk_distance = sl - entry_price
@@ -103,6 +146,7 @@ def run_live_scanner():
                 f"• *Mode:* `3x Isolated Margin`"
             )
             print(msg)
+            save_state({"last_signal_time": signal_timestamp}) # SAVE FIRST
             send_telegram_alert(msg)
             return
 
