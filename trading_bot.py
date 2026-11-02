@@ -1,157 +1,156 @@
-#!/usr/bin/env python3
+import os
+import ccxt
 import requests
 import pandas as pd
-import numpy as np
-import os
-import json
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 
 # ==========================================
-# CONFIGURATION & HARDENING
+# CONFIGURATION & SECRETS (OKX)
 # ==========================================
-SYMBOL = "BTC-USDT-SWAP"
-LEVERAGE = 3
-SL_BUFFER = 0.003  # 0.3% buffer distance
-RR_TARGET = 2.5    # Bumped to 2.5 to absorb fees & funding drag
-STATE_FILE = "state.json"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API_KEY = os.getenv("OKX_API_KEY")
+API_SECRET = os.getenv("OKX_SECRET")
+API_PASSWORD = os.getenv("OKX_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[ALERT] {message}")
+SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
+LEVERAGE = 3
+RISK_PERCENTAGE = 0.03  # 3% Risk per trade
+RISK_REWARD = 2.0
+ATR_MULTIPLIER = 1.5
+VOLUME_MULTIPLIER = 1.5
+JOURNAL_FILE = "trade_journal.json"
+
+# Global variable for debug cooldown
+last_telegram_time = 0
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[TELEGRAM SKIPPED] {message}")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Telegram alert failed: {e}")
+        print(f"[TELEGRAM EXCEPTION] {e}")
 
-# ==========================================
-# STATE MANAGEMENT (DUPLICATE PREVENTION)
-# ==========================================
-def load_state():
-    if os.path.exists(STATE_FILE):
+def initialize_exchange():
+    ex = ccxt.okx({
+        'apiKey': API_KEY, 'secret': API_SECRET, 'password': API_PASSWORD,
+        'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+    })
+    ex.set_sandbox_mode(True) # DEMO MODE
+    return ex
+
+def fetch_history(exchange, symbol, timeframe, limit):
+    all_ohlcv = []
+    since = exchange.milliseconds() - (limit * exchange.parse_timeframe(timeframe) * 1000)
+    while True:
         try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=100)
+            if not ohlcv: break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            if len(all_ohlcv) >= limit: break
+            time.sleep(0.1)
+        except Exception as e: 
+            print(f"Fetch error: {e}")
+            break
+    df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
+    return df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=4)
-
-def is_on_cooldown(signal_time_str):
-    state = load_state()
-    last_signal_time = state.get("last_signal_time")
+def run_scanner():
+    global last_telegram_time
+    exchange = initialize_exchange()
+    print(f"--- Running Crypto Scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
-    if not last_signal_time:
-        return False
-        
-    last_dt = pd.to_datetime(last_signal_time)
-    current_dt = pd.to_datetime(signal_time_str)
-    
-    # Enforce a strict 4-hour (16 candles) cooldown between alerts
-    if current_dt - last_dt < timedelta(hours=4):
-        return True
-    return False
-
-# ==========================================
-# RECENT DATA FETCH (OKX API)
-# ==========================================
-def fetch_recent_data(inst, limit=100):
-    url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst}&bar=15m&limit={limit}"
-    r = requests.get(url, timeout=10).json()
-    if r["code"] != "0" or not r["data"]:
-        return None
-    
-    df = pd.DataFrame(r["data"], columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "confirm"])
-    df = df.iloc[::-1].reset_index(drop=True)
-    for col in ["o", "h", "l", "c"]:
-        df[col] = df[col].astype(float)
-    df['ts'] = pd.to_datetime(df['ts'].astype("int64"), unit="ms")
-    df['ema_50'] = df['c'].ewm(span=50, adjust=False).mean()
-    return df
-
-# ==========================================
-# LIVE SCANNER EXECUTION
-# ==========================================
-def run_live_scanner():
-    df = fetch_recent_data(SYMBOL)
-    if df is None or len(df) < 50:
-        print("Failed to fetch candle data or insufficient history.")
-        return
-
-    i = len(df) - 3
-    sweep_candle = df.iloc[i]
-    confirm_candle = df.iloc[i+1]
-    signal_timestamp = str(df.iloc[i+2]['ts'])
-    ema = sweep_candle['ema_50']
-    
-    is_bullish_trend = sweep_candle['c'] >= ema
-    is_bearish_trend = sweep_candle['c'] < ema
-    
-    prior_low = df['l'].iloc[i-15:i].min()
-    prior_high = df['h'].iloc[i-15:i].max()
-    
-    # --- LONG SETUP ---
-    is_long_sweep = sweep_candle['l'] < prior_low and sweep_candle['c'] > prior_low
-    is_long_disp = confirm_candle['c'] > confirm_candle['o'] and confirm_candle['c'] > sweep_candle['o']
-    
-    if is_bullish_trend and is_long_sweep and is_long_disp:
-        if is_on_cooldown(signal_timestamp):
-            print(f"[{SYMBOL}] Setup detected, but bot is on 4-hour cooldown. Skipping duplicate.")
-            return
+    for symbol in SYMBOLS:
+        try:
+            # Fetch Data
+            df_4h = fetch_history(exchange, symbol, '4h', 100)
+            df_1h = fetch_history(exchange, symbol, '1h', 200)
+            df_15m = fetch_history(exchange, symbol, '15m', 100)
             
-        entry_price = df.iloc[i+2]['o']
-        sl = sweep_candle['l'] * (1.0 - SL_BUFFER)
-        risk_distance = entry_price - sl
-        if risk_distance > 0:
-            tp = entry_price + (risk_distance * RR_TARGET)
-            msg = (
-                f"🚨 *BTC SMC LIVE SIGNAL (LONG)* 🚨\n\n"
-                f"• *Entry:* `${entry_price:,.2f}`\n"
-                f"• *Stop Loss:* `${sl:,.2f}`\n"
-                f"• *Take Profit:* `${tp:,.2f}`\n"
-                f"• *Mode:* `3x Isolated Margin`"
-            )
-            print(msg)
-            save_state({"last_signal_time": signal_timestamp}) # SAVE FIRST
-            send_telegram_alert(msg)
-            return
+            if df_4h.empty or df_15m.empty: continue
 
-    # --- SHORT SETUP ---
-    is_short_sweep = sweep_candle['h'] > prior_high and sweep_candle['c'] < prior_high
-    is_short_disp = confirm_candle['c'] < confirm_candle['o'] and confirm_candle['c'] < sweep_candle['o']
-    
-    if is_bearish_trend and is_short_sweep and is_short_disp:
-        if is_on_cooldown(signal_timestamp):
-            print(f"[{SYMBOL}] Setup detected, but bot is on 4-hour cooldown. Skipping duplicate.")
-            return
+            # 4H Trend
+            df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
+            df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
+            is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
+            is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
+
+            # ATR & Volume MA
+            high_low = df_15m['high'] - df_15m['low']
+            high_close = (df_15m['high'] - df_15m['close'].shift()).abs()
+            low_close = (df_15m['low'] - df_15m['close'].shift()).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            df_15m['atr'] = tr.rolling(window=14).mean()
+            df_15m['vol_ma'] = df_15m['volume'].rolling(window=20).mean()
+
+            sweep_candle = df_15m.iloc[-2]
+            conf_candle = df_15m.iloc[-1]
             
-        entry_price = df.iloc[i+2]['o']
-        sl = sweep_candle['h'] * (1.0 + SL_BUFFER)
-        risk_distance = sl - entry_price
-        if risk_distance > 0:
-            tp = entry_price - (risk_distance * RR_TARGET)
-            msg = (
-                f"🚨 *BTC SMC LIVE SIGNAL (SHORT)* 🚨\n\n"
-                f"• *Entry:* `${entry_price:,.2f}`\n"
-                f"• *Stop Loss:* `${sl:,.2f}`\n"
-                f"• *Take Profit:* `${tp:,.2f}`\n"
-                f"• *Mode:* `3x Isolated Margin`"
-            )
-            print(msg)
-            save_state({"last_signal_time": signal_timestamp}) # SAVE FIRST
-            send_telegram_alert(msg)
-            return
+            recent_low = df_15m['low'].iloc[-20:-2].min()
+            recent_high = df_15m['high'].iloc[-20:-2].max()
 
-    print(f"[{SYMBOL}] No active signal on the latest completed 15m bar.")
+            # Sweep & Volume Logic
+            vol_ok_low = sweep_candle['volume'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER
+            vol_ok_high = sweep_candle['volume'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER
+            
+            swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and vol_ok_low
+            swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and vol_ok_high
+
+            # Confirmation
+            conf_long = conf_candle['close'] > conf_candle['open']
+            conf_short = conf_candle['close'] < conf_candle['open']
+
+            current_price = float(exchange.fetch_ticker(symbol)['last'])
+            atr_value = float(sweep_candle['atr'])
+
+            signal = None
+            if is_bullish and swept_low and conf_long:
+                signal = "LONG"
+                sl = current_price - (atr_value * ATR_MULTIPLIER)
+                risk = current_price - sl
+                tp = current_price + (risk * RISK_REWARD)
+            elif is_bearish and swept_high and conf_short:
+                signal = "SHORT"
+                sl = current_price + (atr_value * ATR_MULTIPLIER)
+                risk = sl - current_price
+                tp = current_price - (risk * RISK_REWARD)
+
+            if signal:
+                print(f"🚨 {symbol} SIGNAL: {signal}")
+                # ... (Your Order Execution logic goes here, I'm keeping it brief to focus on the debug) ...
+                # exchange.create_order(...)
+            else:
+                # 🚨 DEBUG TELEGRAM ALERT WITH 1-HOUR COOLDOWN
+                if time.time() - last_telegram_time > 3600:
+                    vol_debug = "PASS" if (vol_ok_low or vol_ok_high) else "FAIL"
+                    
+                    debug_msg = (
+                        f"🔍 *{symbol} ANALYSIS (HOLD)*\n\n"
+                        f"Price: {current_price:.2f}\n"
+                        f"4H Trend: {'BULL' if is_bullish else 'BEAR' if is_bearish else 'FLAT'}\n"
+                        f"20-Bar Low: {recent_low:.2f}\n"
+                        f"20-Bar High: {recent_high:.2f}\n"
+                        f"Wick Swept Low? {swept_low}\n"
+                        f"Wick Swept High? {swept_high}\n"
+                        f"Volume Filter: {vol_debug}\n"
+                        f"Confirmation? L:{conf_long} S:{conf_short}\n"
+                        f"Result: No setup. Waiting."
+                    )
+                    send_telegram(debug_msg)
+                    print(debug_msg)
+                    last_telegram_time = time.time()
+                else:
+                    print(f"[{symbol}] No signal. (Skipping Telegram to prevent spam)")
+                    
+        except Exception as e:
+            print(f"[ERROR] {symbol}: {e}")
 
 if __name__ == "__main__":
-    run_live_scanner()
-    
+    run_scanner()
