@@ -3,6 +3,7 @@ import ccxt
 import requests
 import pandas as pd
 import time
+import json
 from datetime import datetime
 
 # ==========================================
@@ -22,7 +23,7 @@ ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
 JOURNAL_FILE = "trade_journal.json"
 
-# Global variable for debug cooldown
+# Global variable to prevent Telegram spam
 last_telegram_time = 0
 
 def send_telegram(message):
@@ -36,12 +37,22 @@ def send_telegram(message):
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
 
+def load_journal():
+    if os.path.exists(JOURNAL_FILE):
+        try:
+            with open(JOURNAL_FILE, "r") as f: return json.load(f)
+        except: return []
+    return []
+
+def save_journal(journal):
+    with open(JOURNAL_FILE, "w") as f: json.dump(journal, f, indent=4)
+
 def initialize_exchange():
     ex = ccxt.okx({
         'apiKey': API_KEY, 'secret': API_SECRET, 'password': API_PASSWORD,
         'enableRateLimit': True, 'options': {'defaultType': 'swap'}
     })
-    ex.set_sandbox_mode(True) # DEMO MODE
+    ex.set_sandbox_mode(True) # DEMO MODE (Change to False for real money later)
     return ex
 
 def fetch_history(exchange, symbol, timeframe, limit):
@@ -62,16 +73,44 @@ def fetch_history(exchange, symbol, timeframe, limit):
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     return df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
 
+def check_closed_trades(exchange, journal):
+    updated = False
+    for trade in journal:
+        if trade.get("status") == "OPEN":
+            symbol = trade["symbol"]
+            try:
+                positions = exchange.fetch_positions([symbol])
+                has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
+                
+                if not has_position:
+                    # Trade closed
+                    send_telegram(f"🔔 *TRADE CLOSED: {symbol}*\nCheck OKX app for final PnL.\nStrategy: SMC Sweep")
+                    print(f"Trade closed for {symbol}")
+                    trade["status"] = "CLOSED"
+                    updated = True
+            except Exception as e:
+                print(f"[RESOLVER ERROR] {symbol}: {e}")
+    return updated
+
 def run_scanner():
     global last_telegram_time
     exchange = initialize_exchange()
+    journal = load_journal()
+    
+    if check_closed_trades(exchange, journal):
+        save_journal(journal)
+
     print(f"--- Running Crypto Scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
     for symbol in SYMBOLS:
+        # Skip if we already have an open trade for this symbol
+        if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
+            print(f"[{symbol}] Trade already open. Skipping.")
+            continue
+
         try:
             # Fetch Data
             df_4h = fetch_history(exchange, symbol, '4h', 100)
-            df_1h = fetch_history(exchange, symbol, '1h', 200)
             df_15m = fetch_history(exchange, symbol, '15m', 100)
             
             if df_4h.empty or df_15m.empty: continue
@@ -113,34 +152,78 @@ def run_scanner():
             signal = None
             if is_bullish and swept_low and conf_long:
                 signal = "LONG"
+                side = 'buy'
                 sl = current_price - (atr_value * ATR_MULTIPLIER)
                 risk = current_price - sl
                 tp = current_price + (risk * RISK_REWARD)
             elif is_bearish and swept_high and conf_short:
                 signal = "SHORT"
+                side = 'sell'
                 sl = current_price + (atr_value * ATR_MULTIPLIER)
                 risk = sl - current_price
                 tp = current_price - (risk * RISK_REWARD)
 
             if signal:
                 print(f"🚨 {symbol} SIGNAL: {signal}")
-                # ... (Your Order Execution logic goes here, I'm keeping it brief to focus on the debug) ...
-                # exchange.create_order(...)
+                
+                # --- EXECUTE TRADE ---
+                try:
+                    exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'cross'})
+                    balance = exchange.fetch_balance()['USDT']['free']
+                    risk_amount = balance * RISK_PERCENTAGE
+                    price_risk = abs(current_price - sl)
+                    
+                    market = exchange.market(symbol)
+                    contract_size = market['contractSize']
+                    
+                    raw_contracts = (risk_amount / price_risk) / contract_size
+                    max_position_value = (balance * LEVERAGE) * 0.90
+                    max_contracts_margin = max_position_value / current_price / contract_size
+                    
+                    final_contracts = min(raw_contracts, max_contracts_margin)
+                    amount = float(exchange.amount_to_precision(symbol, final_contracts))
+                    
+                    if amount > 0:
+                        params = {
+                            'stopLoss': {'triggerPrice': float(exchange.price_to_precision(symbol, sl))},
+                            'takeProfit': {'triggerPrice': float(exchange.price_to_precision(symbol, tp))}
+                            # ✅ NO TRAILING STOP HERE ANYMORE
+                        }
+                        
+                        exchange.create_order(symbol, 'market', side, amount, params=params)
+                        
+                        journal.append({
+                            "symbol": symbol, "side": side, "entry": float(current_price),
+                            "sl": float(sl), "tp": float(tp), "amount": float(amount),
+                            "status": "OPEN", "time": datetime.now().isoformat()
+                        })
+                        
+                        send_telegram(
+                            f"✅ *{signal} EXECUTED*\n"
+                            f"Asset: {symbol}\n"
+                            f"Size: {amount} contracts\n"
+                            f"Entry: {current_price:.4f}\n"
+                            f"SL (ATR): {sl:.4f}\n"
+                            f"TP: {tp:.4f}"
+                        )
+                except Exception as e:
+                    print(f"Order Failed: {e}")
+                    send_telegram(f"⚠️ Order Failed on {symbol}:\n{str(e)}")
             else:
                 # 🚨 DEBUG TELEGRAM ALERT WITH 1-HOUR COOLDOWN
                 if time.time() - last_telegram_time > 3600:
                     vol_debug = "PASS" if (vol_ok_low or vol_ok_high) else "FAIL"
+                    trend_str = 'BULLISH' if is_bullish else 'BEARISH' if is_bearish else 'FLAT'
                     
                     debug_msg = (
                         f"🔍 *{symbol} ANALYSIS (HOLD)*\n\n"
                         f"Price: {current_price:.2f}\n"
-                        f"4H Trend: {'BULL' if is_bullish else 'BEAR' if is_bearish else 'FLAT'}\n"
+                        f"4H Trend: {trend_str}\n"
                         f"20-Bar Low: {recent_low:.2f}\n"
                         f"20-Bar High: {recent_high:.2f}\n"
                         f"Wick Swept Low? {swept_low}\n"
                         f"Wick Swept High? {swept_high}\n"
                         f"Volume Filter: {vol_debug}\n"
-                        f"Confirmation? L:{conf_long} S:{conf_short}\n"
                         f"Result: No setup. Waiting."
                     )
                     send_telegram(debug_msg)
@@ -151,6 +234,8 @@ def run_scanner():
                     
         except Exception as e:
             print(f"[ERROR] {symbol}: {e}")
+
+    save_journal(journal)
 
 if __name__ == "__main__":
     run_scanner()
