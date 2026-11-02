@@ -23,6 +23,7 @@ ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
 JOURNAL_FILE = "trade_journal.json"
 
+# Global variable to prevent Telegram spam
 last_telegram_time = 0
 
 def send_telegram(message):
@@ -60,22 +61,58 @@ def check_closed_trades(exchange, journal):
         if trade.get("status") == "OPEN":
             symbol = trade["symbol"]
             try:
-                # Check positions
+                # 1. Check live positions
                 positions = exchange.fetch_positions([symbol])
                 has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
                 
                 if not has_position:
-                    # 🚨 FIX: Wait 3 seconds and check again to prevent OKX API glitches
-                    print(f"[{symbol}] Position appears closed. Double-checking in 3s...")
-                    time.sleep(3)
-                    positions_check = exchange.fetch_positions([symbol])
-                    has_position_check = any(float(p.get('contracts', 0)) > 0 for p in positions_check)
+                    # 🚨 REAL FIX: Verify closure by checking Trade History
+                    print(f"[{symbol}] Position appears closed. Checking trade history to confirm...")
                     
-                    if not has_position_check:
-                        send_telegram(f"🔔 *TRADE CLOSED: {symbol}*\nCheck OKX app for final PnL.\nStrategy: SMC Sweep")
-                        print(f"Trade confirmed closed for {symbol}")
+                    since_time = int(datetime.fromisoformat(trade["time"]).timestamp() * 1000) - 60000
+                    my_trades = exchange.fetch_my_trades(symbol, since=since_time)
+                    
+                    exit_price = float(trade['entry'])
+                    profit = 0.0
+                    exit_found = False
+                    
+                    # Look for the closing trade (side opposite to entry)
+                    for t in my_trades:
+                        if t['side'] != trade['side']:
+                            exit_price = t['price']
+                            amount = t['amount']
+                            
+                            # Calculate actual PnL
+                            if trade['side'] == 'buy': # LONG
+                                profit = (exit_price - float(trade['entry'])) * amount
+                            else: # SHORT
+                                profit = (float(trade['entry']) - exit_price) * amount
+                            
+                            exit_found = True
+                            break
+                    
+                    # If we found the exit trade, the position is 100% closed
+                    if exit_found:
+                        result_emoji = "🟢 WIN" if profit > 0 else "🔴 LOSS"
+                        report = (
+                            f"🔔 *TRADE CLOSED: {symbol}*\n\n"
+                            f"Result: {result_emoji}\n"
+                            f"Side: {'LONG' if trade['side'] == 'buy' else 'SHORT'}\n"
+                            f"Entry: ${trade['entry']:.2f}\n"
+                            f"Exit: ${exit_price:.2f}\n"
+                            f"PnL: ${profit:+.2f} USDT\n\n"
+                            f"🧠 Strategy: SMC Sweep"
+                        )
+                        send_telegram(report)
+                        print(report)
+                        
                         trade["status"] = "CLOSED"
+                        trade["exit"] = float(exit_price)
+                        trade["pnl"] = float(profit)
                         updated = True
+                    else:
+                        # If no exit trade found, it was a position glitch. Do not close.
+                        print(f"[{symbol}] Glitch detected: Position empty, but no exit trade found. Skipping.")
             except Exception as e:
                 print(f"[RESOLVER ERROR] {symbol}: {e}")
     return updated
@@ -109,21 +146,25 @@ def run_scanner():
     print(f"--- Running Crypto Scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
     for symbol in SYMBOLS:
+        # Skip if we already have an open trade for this symbol
         if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
             print(f"[{symbol}] Trade already open. Skipping.")
             continue
 
         try:
+            # Fetch Data
             df_4h = fetch_history(exchange, symbol, '4h', 100)
             df_15m = fetch_history(exchange, symbol, '15m', 100)
             
             if df_4h.empty or df_15m.empty: continue
 
+            # 4H Trend
             df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
             df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
             is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
             is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
 
+            # ATR & Volume MA
             high_low = df_15m['high'] - df_15m['low']
             high_close = (df_15m['high'] - df_15m['close'].shift()).abs()
             low_close = (df_15m['low'] - df_15m['close'].shift()).abs()
@@ -137,12 +178,14 @@ def run_scanner():
             recent_low = df_15m['low'].iloc[-20:-2].min()
             recent_high = df_15m['high'].iloc[-20:-2].max()
 
+            # Sweep & Volume Logic
             vol_ok_low = sweep_candle['volume'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER
             vol_ok_high = sweep_candle['volume'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER
             
             swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and vol_ok_low
             swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and vol_ok_high
 
+            # Confirmation
             conf_long = conf_candle['close'] > conf_candle['open']
             conf_short = conf_candle['close'] < conf_candle['open']
 
@@ -166,6 +209,7 @@ def run_scanner():
             if signal:
                 print(f"🚨 {symbol} SIGNAL: {signal}")
                 
+                # --- EXECUTE TRADE ---
                 try:
                     exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'cross'})
                     balance = exchange.fetch_balance()['USDT']['free']
@@ -208,6 +252,7 @@ def run_scanner():
                     print(f"Order Failed: {e}")
                     send_telegram(f"⚠️ Order Failed on {symbol}:\n{str(e)}")
             else:
+                # 🚨 DEBUG TELEGRAM ALERT WITH 1-HOUR COOLDOWN
                 if time.time() - last_telegram_time > 3600:
                     vol_debug = "PASS" if (vol_ok_low or vol_ok_high) else "FAIL"
                     trend_str = 'BULLISH' if is_bullish else 'BEARISH' if is_bearish else 'FLAT'
