@@ -1,10 +1,10 @@
 import os
+import json
+import time
 import ccxt
 import requests
 import pandas as pd
-import time
-import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ==========================================
 # CONFIGURATION & SECRETS (OKX)
@@ -15,269 +15,414 @@ API_PASSWORD = os.getenv("OKX_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Set OKX_SANDBOX=false in your environment to go live. Defaults to DEMO.
+SANDBOX = os.getenv("OKX_SANDBOX", "true").lower() == "true"
+# "net" (default) or "long_short" - must match your OKX account setting.
+POS_MODE = os.getenv("OKX_POS_MODE", "net").lower()
+HEDGE_MODE = POS_MODE == "long_short"
+
+# ✅ ASSETS: You can add or remove symbols here.
 SYMBOLS = ["BTC/USDT:USDT", "SOL/USDT:USDT"]
+
 LEVERAGE = 3
-RISK_PERCENTAGE = 0.03  # 3% Risk per trade
+RISK_PERCENTAGE = 0.03       # 3% risk per trade
 RISK_REWARD = 2.0
-ATR_MULTIPLIER = 1.5
+ATR_MULTIPLIER = 2.5         # Wide stop for patience
 VOLUME_MULTIPLIER = 1.5
+LOOKBACK = 20                # candles used to find the swept high/low
+
+# ✅ RISK CAPS
+MAX_OPEN_PER_SYMBOL = 1
+MAX_TOTAL_OPEN = 1           # Keeps you to only 1 active trade at a time
+DAILY_LOSS_LIMIT_PCT = 0.06  # Stop trading if you lose 6% of equity in a day
+
+# ✅ STOP PLACEMENT
+USE_WICK_STOP = False        # True = stop goes beyond the sweep wick
+WICK_BUFFER_ATR = 0.1
+
+DEBUG_COOLDOWN_SECONDS = 3600 # 1 hour
+
 JOURNAL_FILE = "trade_journal.json"
+STATE_FILE = "scanner_state.json"
 
-# Global variable to prevent Telegram spam
-last_telegram_time = 0
+# ==========================================
+# HELPERS
+# ==========================================
+def now_utc():
+    return datetime.now(timezone.utc)
 
-def send_telegram(message):
+def atomic_write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp, path)
+
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[LOAD ERROR] {path}: {e}")
+    return default
+
+def load_journal():
+    data = load_json(JOURNAL_FILE, [])
+    return data if isinstance(data, list) else []
+
+def save_journal(journal):
+    atomic_write_json(JOURNAL_FILE, journal)
+
+def load_state():
+    state = load_json(STATE_FILE, {})
+    state.setdefault("last_debug", {})
+    state.setdefault("attempted", [])
+    return state
+
+def save_state(state):
+    state["attempted"] = state["attempted"][-200:] # Keep last 200
+    atomic_write_json(STATE_FILE, state)
+
+def send_telegram(message, markdown=True):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[TELEGRAM SKIPPED] {message}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    if markdown:
+        payload["parse_mode"] = "Markdown"
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if not r.ok and markdown:
+            send_telegram(message, markdown=False)
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
 
-def load_journal():
-    if os.path.exists(JOURNAL_FILE):
-        try:
-            with open(JOURNAL_FILE, "r") as f: return json.load(f)
-        except: return []
-    return []
-
-def save_journal(journal):
-    with open(JOURNAL_FILE, "w") as f: json.dump(journal, f, indent=4)
+def trade_entry_ms(trade):
+    if trade.get("entry_ts_ms"):
+        return int(trade["entry_ts_ms"])
+    dt = datetime.fromisoformat(trade["time"])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 def initialize_exchange():
     ex = ccxt.okx({
-        'apiKey': API_KEY, 'secret': API_SECRET, 'password': API_PASSWORD,
-        'enableRateLimit': True, 'options': {'defaultType': 'swap'}
+        "apiKey": API_KEY, "secret": API_SECRET, "password": API_PASSWORD,
+        "enableRateLimit": True, "options": {"defaultType": "swap"},
     })
-    ex.set_sandbox_mode(True) # DEMO MODE
+    ex.set_sandbox_mode(SANDBOX)
+    ex.load_markets()
     return ex
 
+def has_live_position(exchange, symbol):
+    positions = exchange.fetch_positions([symbol])
+    return any(float(p.get("contracts") or 0) > 0 for p in positions)
+
+def daily_pnl(journal):
+    today = now_utc().date().isoformat()
+    return sum(
+        float(t.get("pnl") or 0) for t in journal
+        if t.get("status") == "CLOSED" and str(t.get("closed_at", ""))[:10] == today
+    )
+
+# ==========================================
+# TRADE RESOLVER (Accurate PnL & Fees)
+# ==========================================
 def check_closed_trades(exchange, journal):
     updated = False
     for trade in journal:
-        if trade.get("status") == "OPEN":
-            symbol = trade["symbol"]
-            try:
-                # 1. Check live positions
-                positions = exchange.fetch_positions([symbol])
-                has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
-                
-                if not has_position:
-                    # 🚨 REAL FIX: Verify closure by checking Trade History
-                    print(f"[{symbol}] Position appears closed. Checking trade history to confirm...")
-                    
-                    since_time = int(datetime.fromisoformat(trade["time"]).timestamp() * 1000) - 60000
-                    my_trades = exchange.fetch_my_trades(symbol, since=since_time)
-                    
-                    exit_price = float(trade['entry'])
-                    profit = 0.0
-                    exit_found = False
-                    
-                    # Look for the closing trade (side opposite to entry)
-                    for t in my_trades:
-                        if t['side'] != trade['side']:
-                            exit_price = t['price']
-                            amount = t['amount']
-                            
-                            # Calculate actual PnL
-                            if trade['side'] == 'buy': # LONG
-                                profit = (exit_price - float(trade['entry'])) * amount
-                            else: # SHORT
-                                profit = (float(trade['entry']) - exit_price) * amount
-                            
-                            exit_found = True
-                            break
-                    
-                    # If we found the exit trade, the position is 100% closed
-                    if exit_found:
-                        result_emoji = "🟢 WIN" if profit > 0 else "🔴 LOSS"
-                        report = (
-                            f"🔔 *TRADE CLOSED: {symbol}*\n\n"
-                            f"Result: {result_emoji}\n"
-                            f"Side: {'LONG' if trade['side'] == 'buy' else 'SHORT'}\n"
-                            f"Entry: ${trade['entry']:.2f}\n"
-                            f"Exit: ${exit_price:.2f}\n"
-                            f"PnL: ${profit:+.2f} USDT\n\n"
-                            f"🧠 Strategy: SMC Sweep"
-                        )
-                        send_telegram(report)
-                        print(report)
-                        
-                        trade["status"] = "CLOSED"
-                        trade["exit"] = float(exit_price)
-                        trade["pnl"] = float(profit)
-                        updated = True
-                    else:
-                        # If no exit trade found, it was a position glitch. Do not close.
-                        print(f"[{symbol}] Glitch detected: Position empty, but no exit trade found. Skipping.")
-            except Exception as e:
-                print(f"[RESOLVER ERROR] {symbol}: {e}")
+        if trade.get("status") != "OPEN":
+            continue
+        symbol = trade["symbol"]
+        try:
+            entry_ms = trade_entry_ms(trade)
+            if exchange.milliseconds() - entry_ms < 60_000:
+                continue # Give exchange time to process
+
+            if has_live_position(exchange, symbol):
+                continue
+
+            fills = exchange.fetch_my_trades(symbol, since=entry_ms - 5000, limit=100)
+            fills = [t for t in fills if t.get("timestamp") and t["timestamp"] >= entry_ms - 5000]
+
+            exit_side = "sell" if trade["side"] == "buy" else "buy"
+            exits = [t for t in fills if t["side"] == exit_side and t["timestamp"] >= entry_ms]
+            entries = [t for t in fills if t["side"] == trade["side"]]
+
+            exit_contracts = sum(float(t["amount"]) for t in exits)
+            if exit_contracts < float(trade["amount"]) * 0.99:
+                continue # Exit fills not found yet
+
+            exit_price = sum(float(t["price"]) * float(t["amount"]) for t in exits) / exit_contracts
+            
+            # Calculate Entry Price
+            entry_contracts = sum(float(t["amount"]) for t in entries)
+            if entry_contracts > 0:
+                entry_price = sum(float(t["price"]) * float(t["amount"]) for t in entries) / entry_contracts
+            else:
+                entry_price = float(trade["entry"])
+
+            # ✅ Correct PnL Math (Contracts * ContractSize)
+            contract_size = float(exchange.market(symbol).get("contractSize") or 1)
+            direction = 1 if trade["side"] == "buy" else -1
+            gross = (exit_price - entry_price) * direction * float(trade["amount"]) * contract_size
+
+            # ✅ Subtract Fees
+            fees = 0.0
+            for t in fills:
+                fee = t.get("fee") or {}
+                if fee.get("cost") is not None and fee.get("currency") in (None, "USDT"):
+                    fees += abs(float(fee["cost"]))
+            profit = gross - fees
+
+            result_emoji = "🟢 WIN" if profit > 0 else "🔴 LOSS"
+            report = (
+                f"🔔 *TRADE CLOSED: {symbol}*\n\n"
+                f"Result: {result_emoji}\n"
+                f"Side: {'LONG' if trade['side'] == 'buy' else 'SHORT'}\n"
+                f"Entry: ${entry_price:.2f}\n"
+                f"Exit: ${exit_price:.2f}\n"
+                f"PnL: ${profit:+.2f} USDT (fees ${fees:.2f})\n"
+            )
+            send_telegram(report)
+            print(report)
+
+            trade["status"] = "CLOSED"
+            trade["exit"] = float(exit_price)
+            trade["pnl"] = float(profit)
+            trade["fees"] = float(fees)
+            trade["closed_at"] = now_utc().isoformat()
+            updated = True
+        except Exception as e:
+            print(f"[RESOLVER ERROR] {symbol}: {e}")
     return updated
 
+# ==========================================
+# DATA FETCH
+# ==========================================
 def fetch_history(exchange, symbol, timeframe, limit):
     all_ohlcv = []
     since = exchange.milliseconds() - (limit * exchange.parse_timeframe(timeframe) * 1000)
-    while True:
+    for _ in range(20): 
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=100)
-            if not ohlcv: break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            if len(all_ohlcv) >= limit: break
-            time.sleep(0.1)
-        except Exception as e: 
-            print(f"Fetch error: {e}")
+        except Exception as e:
+            print(f"[FETCH ERROR] {symbol} {timeframe}: {e}")
             break
-    df = pd.DataFrame(all_ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    return df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
+        if not ohlcv:
+            break
+        all_ohlcv.extend(ohlcv)
+        since = ohlcv[-1][0] + 1
+        if len(all_ohlcv) >= limit:
+            break
+        time.sleep(0.1)
+    df = pd.DataFrame(all_ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+    if df.empty:
+        return df
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
+# ==========================================
+# SCANNER (Main Logic)
+# ==========================================
 def run_scanner():
-    global last_telegram_time
     exchange = initialize_exchange()
     journal = load_journal()
-    
+    state = load_state()
+
     if check_closed_trades(exchange, journal):
         save_journal(journal)
 
-    print(f"--- Running Crypto Scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
-    
-    for symbol in SYMBOLS:
-        # Skip if we already have an open trade for this symbol
-        if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
-            print(f"[{symbol}] Trade already open. Skipping.")
-            continue
+    print(f"--- Scan at {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC ({'DEMO' if SANDBOX else 'LIVE'}) ---")
 
+    for symbol in SYMBOLS:
         try:
-            # Fetch Data
-            df_4h = fetch_history(exchange, symbol, '4h', 100)
-            df_15m = fetch_history(exchange, symbol, '15m', 100)
-            
-            if df_4h.empty or df_15m.empty: continue
+            df_4h = fetch_history(exchange, symbol, "4h", 100)
+            df_15m = fetch_history(exchange, symbol, "15m", 100)
+
+            # ✅ Drop the live, unclosed candle
+            if len(df_4h) > 0:
+                df_4h = df_4h.iloc[:-1].reset_index(drop=True)
+            if len(df_15m) > 0:
+                df_15m = df_15m.iloc[:-1].reset_index(drop=True)
+
+            if len(df_4h) < 60 or len(df_15m) < LOOKBACK + 5:
+                continue
 
             # 4H Trend
-            df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
-            df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
-            is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
-            is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
+            df_4h["ema20"] = df_4h["close"].ewm(span=20, adjust=False).mean()
+            df_4h["ema50"] = df_4h["close"].ewm(span=50, adjust=False).mean()
+            is_bullish = df_4h["ema20"].iloc[-1] > df_4h["ema50"].iloc[-1]
+            is_bearish = df_4h["ema20"].iloc[-1] < df_4h["ema50"].iloc[-1]
 
-            # ATR & Volume MA
-            high_low = df_15m['high'] - df_15m['low']
-            high_close = (df_15m['high'] - df_15m['close'].shift()).abs()
-            low_close = (df_15m['low'] - df_15m['close'].shift()).abs()
+            # ATR & Vol
+            high_low = df_15m["high"] - df_15m["low"]
+            high_close = (df_15m["high"] - df_15m["close"].shift()).abs()
+            low_close = (df_15m["low"] - df_15m["close"].shift()).abs()
             tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            df_15m['atr'] = tr.rolling(window=14).mean()
-            df_15m['vol_ma'] = df_15m['volume'].rolling(window=20).mean()
+            df_15m["atr"] = tr.rolling(window=14).mean()
+            df_15m["vol_ma"] = df_15m["volume"].rolling(window=20).mean()
 
+            # ✅ Use closed candles for logic
             sweep_candle = df_15m.iloc[-2]
             conf_candle = df_15m.iloc[-1]
-            
-            recent_low = df_15m['low'].iloc[-20:-2].min()
-            recent_high = df_15m['high'].iloc[-20:-2].max()
 
-            # Sweep & Volume Logic
-            vol_ok_low = sweep_candle['volume'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER
-            vol_ok_high = sweep_candle['volume'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER
-            
-            swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and vol_ok_low
-            swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and vol_ok_high
+            if pd.isna(sweep_candle["atr"]) or pd.isna(sweep_candle["vol_ma"]):
+                continue
 
-            # Confirmation
-            conf_long = conf_candle['close'] > conf_candle['open']
-            conf_short = conf_candle['close'] < conf_candle['open']
+            recent_low = df_15m["low"].iloc[-(LOOKBACK + 2):-2].min()
+            recent_high = df_15m["high"].iloc[-(LOOKBACK + 2):-2].max()
 
-            current_price = float(exchange.fetch_ticker(symbol)['last'])
-            atr_value = float(sweep_candle['atr'])
+            vol_ok = sweep_candle["volume"] > sweep_candle["vol_ma"] * VOLUME_MULTIPLIER
+            swept_low = (sweep_candle["low"] < recent_low) and (sweep_candle["close"] > recent_low) and vol_ok
+            swept_high = (sweep_candle["high"] > recent_high) and (sweep_candle["close"] < recent_high) and vol_ok
+
+            conf_long = conf_candle["close"] > conf_candle["open"]
+            conf_short = conf_candle["close"] < conf_candle["open"]
+
+            current_price = float(exchange.fetch_ticker(symbol)["last"])
+            atr_value = float(sweep_candle["atr"])
 
             signal = None
+            side = None
+            sl = tp = None
+            
             if is_bullish and swept_low and conf_long:
-                signal = "LONG"
-                side = 'buy'
+                signal, side = "LONG", "buy"
                 sl = current_price - (atr_value * ATR_MULTIPLIER)
+                if USE_WICK_STOP:
+                    sl = min(sl, float(sweep_candle["low"]) - atr_value * WICK_BUFFER_ATR)
                 risk = current_price - sl
                 tp = current_price + (risk * RISK_REWARD)
             elif is_bearish and swept_high and conf_short:
-                signal = "SHORT"
-                side = 'sell'
+                signal, side = "SHORT", "sell"
                 sl = current_price + (atr_value * ATR_MULTIPLIER)
+                if USE_WICK_STOP:
+                    sl = max(sl, float(sweep_candle["high"]) + atr_value * WICK_BUFFER_ATR)
                 risk = sl - current_price
                 tp = current_price - (risk * RISK_REWARD)
 
             if signal:
-                print(f"🚨 {symbol} SIGNAL: {signal}")
-                
-                # --- EXECUTE TRADE ---
+                # ✅ Guard 1: Deduplication (Don't trade the same sweep twice)
+                sweep_key = f"{symbol}|{sweep_candle['time']}"
+                already = sweep_key in state["attempted"] or any(t.get("sweep_key") == sweep_key for t in journal)
+                if already:
+                    continue
+
+                # ✅ Guard 2: Risk Caps
+                open_trades = [t for t in journal if t.get("status") == "OPEN"]
+                if sum(1 for t in open_trades if t["symbol"] == symbol) >= MAX_OPEN_PER_SYMBOL:
+                    continue
+                if len(open_trades) >= MAX_TOTAL_OPEN:
+                    continue
+                if has_live_position(exchange, symbol):
+                    continue
+
                 try:
-                    exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'cross'})
-                    balance = exchange.fetch_balance()['USDT']['free']
-                    risk_amount = balance * RISK_PERCENTAGE
+                    balances = exchange.fetch_balance()["USDT"]
+                    equity = float(balances.get("total") or 0)
+                    free = float(balances.get("free") or 0)
+
+                    # ✅ Guard 3: Daily Loss Limit
+                    if daily_pnl(journal) <= -(equity * DAILY_LOSS_LIMIT_PCT):
+                        send_telegram("🛑 Daily loss limit reached. Pausing for today.")
+                        continue
+
+                    # Record attempt to prevent loops
+                    state["attempted"].append(sweep_key)
+                    save_state(state)
+
+                    # ✅ Isolated Margin Setup
+                    margin_params = {"mgnMode": "isolated"}
+                    if HEDGE_MODE:
+                        margin_params["posSide"] = "long" if side == "buy" else "short"
+                    exchange.set_leverage(LEVERAGE, symbol, margin_params)
+
+                    risk_amount = equity * RISK_PERCENTAGE
                     price_risk = abs(current_price - sl)
-                    
+
                     market = exchange.market(symbol)
-                    contract_size = market['contractSize']
-                    
+                    contract_size = float(market["contractSize"])
+
                     raw_contracts = (risk_amount / price_risk) / contract_size
-                    max_position_value = (balance * LEVERAGE) * 0.90
+                    max_position_value = (free * LEVERAGE) * 0.90
                     max_contracts_margin = max_position_value / current_price / contract_size
-                    
+
                     final_contracts = min(raw_contracts, max_contracts_margin)
                     amount = float(exchange.amount_to_precision(symbol, final_contracts))
-                    
-                    if amount > 0:
-                        params = {
-                            'stopLoss': {'triggerPrice': float(exchange.price_to_precision(symbol, sl))},
-                            'takeProfit': {'triggerPrice': float(exchange.price_to_precision(symbol, tp))}
-                        }
-                        
-                        exchange.create_order(symbol, 'market', side, amount, params=params)
-                        
-                        journal.append({
-                            "symbol": symbol, "side": side, "entry": float(current_price),
-                            "sl": float(sl), "tp": float(tp), "amount": float(amount),
-                            "status": "OPEN", "time": datetime.now().isoformat()
-                        })
-                        
-                        send_telegram(
-                            f"✅ *{signal} EXECUTED*\n"
-                            f"Asset: {symbol}\n"
-                            f"Size: {amount} contracts\n"
-                            f"Entry: {current_price:.4f}\n"
-                            f"SL (ATR): {sl:.4f}\n"
-                            f"TP: {tp:.4f}"
-                        )
+
+                    if amount <= 0:
+                        continue
+
+                    # ✅ Order Execution
+                    params = {
+                        "tdMode": "isolated",
+                        "stopLoss": {"triggerPrice": float(exchange.price_to_precision(symbol, sl))},
+                        "takeProfit": {"triggerPrice": float(exchange.price_to_precision(symbol, tp))},
+                    }
+                    if HEDGE_MODE:
+                        params["posSide"] = "long" if side == "buy" else "short"
+
+                    order = exchange.create_order(symbol, "market", side, amount, params=params)
+
+                    trigger_data = {
+                        "trend": "BULLISH" if is_bullish else "BEARISH",
+                        "swept_low": bool(swept_low),
+                        "swept_high": bool(swept_high),
+                        "volume_ratio": float(sweep_candle["volume"] / sweep_candle["vol_ma"]),
+                        "atr": float(atr_value),
+                    }
+
+                    journal.append({
+                        "symbol": symbol, "side": side, "entry": float(current_price),
+                        "sl": float(sl), "tp": float(tp), "amount": float(amount),
+                        "status": "OPEN",
+                        "time": now_utc().isoformat(),
+                        "entry_ts_ms": int(exchange.milliseconds()),
+                        "order_id": order.get("id"),
+                        "sweep_key": sweep_key,
+                        "trigger_data": trigger_data,
+                    })
+                    save_journal(journal)
+
+                    send_telegram(
+                        f"✅ *{signal} EXECUTED*\n"
+                        f"Asset: {symbol}\n"
+                        f"Entry: {current_price:.4f}\n"
+                        f"SL: {sl:.4f}\n"
+                        f"TP: {tp:.4f}\n"
+                        f"Size: {amount} contracts\n\n"
+                        f"🔍 *Trigger Data:*\n"
+                        f"Trend: {trigger_data['trend']}\n"
+                        f"Vol Ratio: {trigger_data['volume_ratio']:.2f}x\n"
+                        f"Swept: {'Low' if swept_low else 'High'}\n"
+                        f"ATR: {atr_value:.2f}"
+                    )
                 except Exception as e:
                     print(f"Order Failed: {e}")
-                    send_telegram(f"⚠️ Order Failed on {symbol}:\n{str(e)}")
+                    send_telegram(f"⚠️ Order Failed on {symbol}:\n{e}", markdown=False)
             else:
-                # 🚨 DEBUG TELEGRAM ALERT WITH 1-HOUR COOLDOWN
-                if time.time() - last_telegram_time > 3600:
-                    vol_debug = "PASS" if (vol_ok_low or vol_ok_high) else "FAIL"
-                    trend_str = 'BULLISH' if is_bullish else 'BEARISH' if is_bearish else 'FLAT'
-                    
+                last = float(state["last_debug"].get(symbol, 0))
+                if time.time() - last > DEBUG_COOLDOWN_SECONDS:
+                    trend_str = "BULLISH" if is_bullish else "BEARISH" if is_bearish else "FLAT"
                     debug_msg = (
                         f"🔍 *{symbol} ANALYSIS (HOLD)*\n\n"
                         f"Price: {current_price:.2f}\n"
                         f"4H Trend: {trend_str}\n"
-                        f"20-Bar Low: {recent_low:.2f}\n"
-                        f"20-Bar High: {recent_high:.2f}\n"
-                        f"Wick Swept Low? {swept_low}\n"
-                        f"Wick Swept High? {swept_high}\n"
-                        f"Volume Filter: {vol_debug}\n"
-                        f"Result: No setup. Waiting."
+                        f"Swept Low? {bool(swept_low)}\n"
+                        f"Swept High? {bool(swept_high)}\n"
+                        f"Volume Filter: {'PASS' if vol_ok else 'FAIL'}\n"
+                        f"Result: Waiting."
                     )
                     send_telegram(debug_msg)
-                    print(debug_msg)
-                    last_telegram_time = time.time()
-                else:
-                    print(f"[{symbol}] No signal. (Skipping Telegram to prevent spam)")
-                    
+                    state["last_debug"][symbol] = time.time()
+
         except Exception as e:
             print(f"[ERROR] {symbol}: {e}")
 
     save_journal(journal)
+    save_state(state)
 
 if __name__ == "__main__":
     run_scanner()
