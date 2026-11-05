@@ -17,18 +17,14 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SANDBOX = os.getenv("OKX_SANDBOX", "true").lower() == "true"
-POS_MODE = os.getenv("OKX_POS_MODE", "net").lower()
 
-# ✅ ONLY SOLANA
 SYMBOLS = ["SOL/USDT:USDT"]
-
 LEVERAGE = 3
 RISK_PERCENTAGE = 0.015      # 1.5% risk per trade
 JOURNAL_FILE = "trade_journal.json"
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
+last_telegram_time = 0
+
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -74,6 +70,7 @@ def fetch_ohlcv(exchange, symbol, timeframe, limit):
 # STRATEGY ENGINE: SOL 4H TREND
 # ==========================================
 def run_sol_strategy(exchange, journal):
+    global last_telegram_time
     symbol = "SOL/USDT:USDT"
     print(f"--- Scanning {symbol} (4H Trend) ---", flush=True)
     
@@ -83,7 +80,6 @@ def run_sol_strategy(exchange, journal):
         try:
             current_price = float(exchange.fetch_ticker(symbol)['last'])
             
-            # We need the current 4H ATR to calculate the trail
             raw_4h = fetch_ohlcv(exchange, symbol, "4h", 50)
             if not raw_4h: continue
             df = pd.DataFrame(raw_4h, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -92,26 +88,22 @@ def run_sol_strategy(exchange, journal):
             current_atr = df['atr'].iloc[-1]
             
             if trade['side'] == 'buy':
-                # Trail the stop up based on Current Price - (3 * ATR)
                 trail_sl = current_price - (current_atr * 3.0)
                 if trail_sl > trade['sl']:
                     trade['sl'] = trail_sl
                     save_json(JOURNAL_FILE, journal)
                     print(f"[{symbol}] Trailing Stop updated to {trail_sl:.4f}", flush=True)
                 
-                # Check if hit
                 if current_price <= trade['sl']:
                     close_trade(exchange, journal, trade, current_price, "Trailing Stop Hit")
                     return
             else:
-                # Trail the stop down based on Current Price + (3 * ATR)
                 trail_sl = current_price + (current_atr * 3.0)
                 if trail_sl < trade['sl']:
                     trade['sl'] = trail_sl
                     save_json(JOURNAL_FILE, journal)
                     print(f"[{symbol}] Trailing Stop updated to {trail_sl:.4f}", flush=True)
                 
-                # Check if hit
                 if current_price >= trade['sl']:
                     close_trade(exchange, journal, trade, current_price, "Trailing Stop Hit")
                     return
@@ -127,9 +119,8 @@ def run_sol_strategy(exchange, journal):
     if not raw_4h: return
 
     df = pd.DataFrame(raw_4h, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-    df = df.iloc[:-1].reset_index(drop=True) # Drop the currently forming 4H candle
+    df = df.iloc[:-1].reset_index(drop=True)
 
-    # Indicators
     df['tr'] = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
     df['atr'] = df['tr'].ewm(alpha=1/14, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
@@ -148,35 +139,54 @@ def run_sol_strategy(exchange, journal):
     df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
     last = df.iloc[-1]
+    current_price = float(exchange.fetch_ticker(symbol)['last'])
     
     is_trending = last['adx'] > 20
     vol_ok = last['volume'] > last['vol_ma'] * 1.5
+    is_bullish = last['close'] > last['ema200']
+    is_bearish = last['close'] < last['ema200']
     
     side = None
-    if is_trending and vol_ok and last['close'] > last['ema200'] and last['close'] > last['don_high']:
+    if is_trending and vol_ok and is_bullish and last['close'] > last['don_high']:
         side = 'buy'
-    elif is_trending and vol_ok and last['close'] < last['ema200'] and last['close'] < last['don_low']:
+    elif is_trending and vol_ok and is_bearish and last['close'] < last['don_low']:
         side = 'sell'
 
     if side:
-        entry = float(exchange.fetch_ticker(symbol)['last'])
+        entry = current_price
         atr = last['atr']
         
         if side == 'buy':
-            sl = entry - (atr * 2.0) # Initial 2.0 ATR stop
-            tp = 0 # No fixed TP, trailing stop handles it
+            sl = entry - (atr * 2.0)
+            tp = 0
         else:
             sl = entry + (atr * 2.0)
             tp = 0 
 
         execute_trade(exchange, journal, symbol, side, entry, sl, tp, atr)
+    else:
+        # ✅ NEW DEBUG TELEGRAM (1 hour cooldown)
+        if time.time() - last_telegram_time > 3600:
+            debug_msg = (
+                f"🔍 *SOL 4H TREND ANALYSIS (HOLD)*\n\n"
+                f"Price: {current_price:.4f}\n"
+                f"ADX: {last['adx']:.1f} (Needs >20)\n"
+                f"Vol Filter: {'PASS' if vol_ok else 'FAIL'}\n"
+                f"Above EMA200? {is_bullish}\n"
+                f"Below EMA200? {is_bearish}\n"
+                f"Broken High? {last['close'] > last['don_high']}\n"
+                f"Broken Low? {last['close'] < last['don_low']}\n"
+                f"Result: Waiting for setup."
+            )
+            send_telegram(debug_msg)
+            print(debug_msg)
+            last_telegram_time = time.time()
 
 # ==========================================
 # EXECUTION & MANAGEMENT
 # ==========================================
 def execute_trade(exchange, journal, symbol, side, entry, sl, tp, atr):
     try:
-        # ✅ ISOLATED MARGIN
         exchange.set_leverage(LEVERAGE, symbol, {'mgnMode': 'isolated'})
         
         balance = exchange.fetch_balance()['USDT']['free']
